@@ -156,20 +156,45 @@ tabs = st.tabs([
 with tabs[0]:
     st.header("📊 Executive Overview")
 
-    # Define safe test_df and lost revenue
+    # -- Sidebar Filters --
+    df_filtered = df.copy()
+
+    if "Test_Name" in df.columns:
+        test_filter = st.sidebar.multiselect("Filter by Test", sorted(df["Test_Name"].dropna().unique()))
+        if test_filter:
+            df_filtered = df_filtered[df_filtered["Test_Name"].isin(test_filter)]
+
+    if "Client_Facility" in df.columns:
+        client_filter = st.sidebar.multiselect("Filter by Client", sorted(df["Client_Facility"].dropna().unique()))
+        if client_filter:
+            df_filtered = df_filtered[df_filtered["Client_Facility"].isin(client_filter)]
+
+    if "Analyst" in df.columns:
+        analyst_filter = st.sidebar.multiselect("Filter by Analyst", sorted(df["Analyst"].dropna().unique()))
+        if analyst_filter:
+            df_filtered = df_filtered[df_filtered["Analyst"].isin(analyst_filter)]
+
+    # -- Define safe test_df and lost revenue for fallback
+    canceled_df = df_filtered[df_filtered["Submission_Status"] == "Canceled"]
     test_df = canceled_df.copy() if not canceled_df.empty else pd.DataFrame(columns=["Price"])
     test_df["Price"] = pd.to_numeric(test_df.get("Price", pd.NA), errors="coerce")
     test_revenue = test_df["Price"].sum()
 
-    # KPIs
+    # -- KPIs --
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Active Tests", f"{df.shape[0]:,}")
-    if "Price" in df.columns:
-        col2.metric("Total Revenue", f"${df['Price'].sum():,.2f}")
+
+    col1.metric("Total Active Tests", f"{df_filtered.shape[0]:,}")
+
+    if "Price" in df_filtered.columns:
+        col2.metric("Total Revenue", f"${df_filtered['Price'].sum():,.2f}")
+        col3.metric("Avg Price/Test", f"${df_filtered['Price'].mean():.2f}")
     else:
         col2.metric("Total Revenue", "N/A")
-    col3.metric("Avg Price/Test", f"${df['Price'].mean():.2f}")
-    col4.metric("Lost Revenue (Canceled)", f"${test_revenue:,.2f}", delta_color="inverse")
+        col3.metric("Avg Price/Test", "N/A")
+
+    canceled_revenue = df_filtered[df_filtered["Submission_Status"] == "Canceled"]["Price"].sum()
+    col4.metric("Lost Revenue (Canceled)", f"${canceled_revenue:,.2f}", delta_color="inverse")
+
 
     # Top 5 Tests by Volume
     st.subheader("📊 Top 5 Tests by Volume")
@@ -289,25 +314,21 @@ with tabs[2]:
 
     from datetime import timedelta
 
-    def add_days_skipping_sundays(start_date, days_to_add):
-        current = start_date
-        added_days = 0
-        while added_days < days_to_add:
-            current += timedelta(days=1)
-            if current.weekday() != 6:  # Skip Sundays only
-                added_days += 1
-        return current
+    def adjusted_calendar_delay(submit_date, est_date):
+        days = pd.date_range(start=submit_date + timedelta(days=1), end=est_date)
+        skipped = sum(1 for d in days if d.weekday() in [5, 6])  # Sat or Sun
+        return est_date - timedelta(days=skipped)
 
-    delay_toggle = st.sidebar.radio("📅 Delay Calculation Method", ["Calendar (incl. Sat)", "System Business Days"], horizontal=True)
+    delay_toggle = st.sidebar.radio("📅 Delay Calculation Method", ["Adjusted (skip Sat & Sun)", "System ETC"], horizontal=True)
 
-    if all(col in df.columns for col in ["Submission_Release_Date", "Estimated_Completion_Date"]):
-        df["Estimated_Duration"] = (df["Estimated_Completion_Date"] - df["Submission_Release_Date"]).dt.days
-        if delay_toggle == "Calendar (incl. Sat)":
+    if all(col in df.columns for col in ["Submission_Release_Date", "Estimated_Completion_Date", "Completion_Date"]):
+        if delay_toggle == "Adjusted (skip Sat & Sun)":
             df["Expected_Completion"] = df.apply(
-                lambda row: add_days_skipping_sundays(row["Submission_Release_Date"], row["Estimated_Duration"]), axis=1
+                lambda row: adjusted_calendar_delay(row["Submission_Release_Date"], row["Estimated_Completion_Date"]), axis=1
             )
         else:
             df["Expected_Completion"] = df["Estimated_Completion_Date"]
+
         df["Delay_Days"] = (df["Completion_Date"] - df["Expected_Completion"]).dt.days
         df["Delay_Method"] = delay_toggle
 
@@ -363,24 +384,46 @@ with tabs[2]:
 
     st.subheader("🧑‍🔬 Analyst Breakdown by Test")
     if all(col in df.columns for col in ["Test_Name", "Analyst", "Price", "Delay_Days"]):
-        analyst_test = df.groupby(["Test_Name", "Analyst"]).agg(
+        analyst_test = df.groupby("Analyst").agg(
             Total_Revenue=("Price", "sum"),
             Avg_Delay=("Delay_Days", "mean"),
             Volume=("Test_Name", "count")
         ).reset_index()
 
-        # Highlight top 3 most efficient (lowest Avg_Delay)
-        fastest = analyst_test.sort_values("Avg_Delay").head(3)
-        st.markdown("### 🏅 Top 3 Fastest Analysts")
-        st.dataframe(fastest.round(2), use_container_width=True)
+        st.markdown("### 📈 Test Volume by Analyst")
+        fig_bar = px.bar(analyst_test.sort_values("Volume", ascending=False),
+                         x="Analyst", y="Volume", text="Volume",
+                         title="Total Test Volume Handled by Analyst",
+                         labels={"Volume": "Number of Tests", "Analyst": "Analyst"})
+        fig_bar.update_traces(marker_color="#4c78a8", textposition="outside")
+        fig_bar.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig_bar, use_container_width=True)
 
         st.markdown("### 📊 Full Analyst Performance Table")
-        st.dataframe(analyst_test.sort_values("Total_Revenue", ascending=False).round(2))
+        st.dataframe(analyst_test.sort_values("Volume", ascending=False).round(2))
         generate_download_link(analyst_test, "analyst_breakdown_by_test.csv")
+
 
 # === Delays & TAT === #
 with tabs[3]:
     st.header("⏱ Delays and Turnaround Time")
+
+    from datetime import timedelta
+
+    def adjusted_calendar_delay(submit_date, est_date):
+        # Count how many weekend days exist between submission and ETC
+        days = pd.date_range(start=submit_date + timedelta(days=1), end=est_date)
+        skipped = sum(1 for d in days if d.weekday() in [5, 6])  # Saturday or Sunday
+        # Subtract weekend days to get calendar-adjusted ETC
+        return est_date - timedelta(days=skipped)
+
+    if all(col in df.columns for col in ["Submission_Release_Date", "Estimated_Completion_Date", "Completion_Date"]):
+        df["Adjusted_ETC"] = df.apply(
+            lambda row: adjusted_calendar_delay(row["Submission_Release_Date"], row["Estimated_Completion_Date"]),
+            axis=1
+        )
+        df["Delay_Days"] = (df["Completion_Date"] - df["Adjusted_ETC"]).dt.days
+        df["Delay_Method"] = "System ETC minus weekends (Sat & Sun)"
 
     # Filter only valid completed rows with usable delay values
     if all(col in df.columns for col in ["Status", "Delay_Days"]):
@@ -416,17 +459,30 @@ with tabs[3]:
             st.plotly_chart(fig12, use_container_width=True, key="fig12_rush")
             generate_download_link(rush_delay, "rush_vs_nonrush_delay.csv")
 
-        # --- Delay by Test & Facility Type ---
-        st.subheader("🔍 Avg Delay by Test & Facility Type")
-        if all(col in completed_df.columns for col in ["Test_Name", "Facility_Type"]):
-            delay_fac = completed_df.groupby(["Test_Name", "Facility_Type"])["Delay_Days"].mean().dropna().reset_index()
-            fig14 = px.bar(
-                delay_fac.sort_values("Delay_Days", ascending=False).head(20),
-                x="Test_Name", y="Delay_Days", color="Facility_Type", barmode="group",
-                text="Delay_Days", title="Top Delays by Test and Facility Type"
-            )
-            fig14.update_layout(xaxis_title="Test Name", yaxis_title="Avg Delay (Days)", bargap=0.3)
-            st.plotly_chart(fig14, use_container_width=True, key="fig14_delay_fac")
+            # --- Delay by Client Facility ---
+            st.subheader("🔍 Avg Delay by Client Facility")
+            if "Client_Facility" in completed_df.columns:
+                delay_client = (
+                    completed_df.groupby("Client_Facility")["Delay_Days"]
+                    .mean()
+                    .dropna()
+                    .reset_index()
+                    .sort_values("Delay_Days", ascending=False)
+                    .head(20))
+
+                fig14 = px.bar(
+                    delay_client,
+                    x="Client_Facility",
+                    y="Delay_Days",
+                    text="Delay_Days",
+                    title="Top 20 Clients by Avg Delay",)
+                fig14.update_layout(
+                    xaxis_title="Client Facility",
+                    yaxis_title="Avg Delay (Days)",
+                    bargap=0.3,
+                    xaxis_tickangle=-45)
+                st.plotly_chart(fig14, use_container_width=True, key="fig14_delay_client")
+
 
         # --- Delay Table Preview ---
         st.subheader("📋 Delay Data Preview")
@@ -439,6 +495,7 @@ with tabs[3]:
         generate_download_link(status_count, "ontime_vs_delayed.csv")
     else:
         st.warning("Delay and completion status columns not found in data.")
+
 
 
 # === Forecasting === #
