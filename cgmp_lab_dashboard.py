@@ -471,8 +471,8 @@ with tabs[4]:
                 price_avg=("Price", "mean")
             ).fillna(0).reset_index()
 
-            full_range = pd.date_range(agg_df["ds"].min(), agg_df["ds"].max(), freq=freq)
-            agg_df = agg_df.set_index("ds").reindex(full_range).fillna(0).rename_axis("ds").reset_index()
+            # Remove periods with zero tests (e.g., weekends)
+            agg_df = agg_df[agg_df["y"] > 0]
 
             from prophet import Prophet
             m = Prophet(interval_width=confidence_level / 100)
@@ -481,7 +481,7 @@ with tabs[4]:
             forecast = m.predict(future).merge(agg_df, on="ds", how="left")
 
             forecast["price_avg"] = forecast["price_avg"].ffill().replace(0, np.nan).fillna(method="bfill")
-            forecast["Predicted Volume"] = forecast["yhat"]
+            forecast["Predicted Volume"] = forecast["yhat"].clip(lower=0)
             forecast["Actual Volume"] = forecast["y"]
             forecast["Predicted Revenue"] = forecast["Predicted Volume"] * forecast["price_avg"]
             forecast["Actual Revenue"] = forecast["Actual Volume"] * forecast["price_avg"]
@@ -585,7 +585,6 @@ with tabs[4]:
             st.error(f"❌ Forecasting failed for {test}: {e}")
 
 
-
 # === Statistical Insights === #
 with tabs[5]:
     st.header("📐 Statistical Insights by Test")
@@ -654,12 +653,4 @@ with tabs[5]:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.warning("Missing column: 'Price'")
-
-
-
-
-
-
-
-
 
