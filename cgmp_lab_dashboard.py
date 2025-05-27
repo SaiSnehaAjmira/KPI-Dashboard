@@ -283,13 +283,34 @@ with tabs[1]:
         st.dataframe(top_tests_per_client)
         generate_download_link(top_tests_per_client, "top_tests_by_client_facility.csv")
 
-
-
 # === Test Performance === #
 with tabs[2]:
     st.header("🧪 Test-Level Performance")
 
-    # KPIs
+    from datetime import timedelta
+
+    def add_days_skipping_sundays(start_date, days_to_add):
+        current = start_date
+        added_days = 0
+        while added_days < days_to_add:
+            current += timedelta(days=1)
+            if current.weekday() != 6:  # Skip Sundays only
+                added_days += 1
+        return current
+
+    delay_toggle = st.sidebar.radio("📅 Delay Calculation Method", ["Calendar (incl. Sat)", "System Business Days"], horizontal=True)
+
+    if all(col in df.columns for col in ["Submission_Release_Date", "Estimated_Completion_Date"]):
+        df["Estimated_Duration"] = (df["Estimated_Completion_Date"] - df["Submission_Release_Date"]).dt.days
+        if delay_toggle == "Calendar (incl. Sat)":
+            df["Expected_Completion"] = df.apply(
+                lambda row: add_days_skipping_sundays(row["Submission_Release_Date"], row["Estimated_Duration"]), axis=1
+            )
+        else:
+            df["Expected_Completion"] = df["Estimated_Completion_Date"]
+        df["Delay_Days"] = (df["Completion_Date"] - df["Expected_Completion"]).dt.days
+        df["Delay_Method"] = delay_toggle
+
     col1, col2, col3 = st.columns(3)
     col1.metric("Unique Tests", df["Test_Name"].nunique() if "Test_Name" in df.columns else 0)
 
@@ -314,7 +335,6 @@ with tabs[2]:
         most_delayed_test = "N/A"
     col3.metric("Most Delayed Test (Avg)", most_delayed_test)
 
-    # --- Volume by Test ---
     st.subheader("📊 Volume by Test")
     if "Test_Name" in df.columns:
         test_volume = df["Test_Name"].value_counts().reset_index(name="Volume").rename(columns={"index": "Test_Name"})
@@ -323,7 +343,6 @@ with tabs[2]:
         st.plotly_chart(fig7, use_container_width=True, key="fig7_volume")
         generate_download_link(test_volume, "test_volume.csv")
 
-    # --- Revenue by Test ---
     st.subheader("💵 Revenue by Test")
     if all(col in df.columns for col in ["Test_Name", "Price"]):
         test_revenue_data = df.groupby("Test_Name")["Price"].sum().nlargest(10).reset_index()
@@ -332,7 +351,6 @@ with tabs[2]:
         st.plotly_chart(fig8, use_container_width=True, key="fig8_revenue")
         generate_download_link(test_revenue_data, "test_revenue.csv")
 
-    # --- Delay by Test (Completed Only) ---
     st.subheader("⏳ Average Delay by Test")
     if all(col in df.columns for col in ["Status", "Test_Name", "Delay_Days"]):
         completed_only = df[df["Status"] == "Completed"]
@@ -343,7 +361,6 @@ with tabs[2]:
         st.plotly_chart(fig9, use_container_width=True, key="fig9_delay")
         generate_download_link(delay_by_test, "average_delay_by_test.csv")
 
-    # --- Analyst Breakdown ---
     st.subheader("🧑‍🔬 Analyst Breakdown by Test")
     if all(col in df.columns for col in ["Test_Name", "Analyst", "Price", "Delay_Days"]):
         analyst_test = df.groupby(["Test_Name", "Analyst"]).agg(
@@ -351,31 +368,15 @@ with tabs[2]:
             Avg_Delay=("Delay_Days", "mean"),
             Volume=("Test_Name", "count")
         ).reset_index()
+
+        # Highlight top 3 most efficient (lowest Avg_Delay)
+        fastest = analyst_test.sort_values("Avg_Delay").head(3)
+        st.markdown("### 🏅 Top 3 Fastest Analysts")
+        st.dataframe(fastest.round(2), use_container_width=True)
+
+        st.markdown("### 📊 Full Analyst Performance Table")
         st.dataframe(analyst_test.sort_values("Total_Revenue", ascending=False).round(2))
         generate_download_link(analyst_test, "analyst_breakdown_by_test.csv")
-
-    # --- Volume by Test & Facility Type ---
-    st.subheader("🏷 Volume by Test & Facility Type")
-    if all(col in df.columns for col in ["Test_Name", "Facility_Type"]):
-        volume_by_test_facility = df.groupby(["Test_Name", "Facility_Type"]).size().reset_index(name="Volume")
-        fig10 = px.bar(volume_by_test_facility.sort_values("Volume", ascending=False).head(15),
-                       x="Test_Name", y="Volume", color="Facility_Type", text="Volume",
-                       barmode="group", title="Top Test Volumes by Facility Type")
-        fig10.update_layout(xaxis_title="Test Name", yaxis_title="Volume", bargap=0.3)
-        st.plotly_chart(fig10, use_container_width=True, key="fig10_volume_fac")
-        generate_download_link(volume_by_test_facility, "volume_by_test_facility.csv")
-
-    # --- Revenue by Test & Facility Type ---
-    st.subheader("💰 Revenue by Test & Facility Type")
-    if all(col in df.columns for col in ["Test_Name", "Facility_Type", "Price"]):
-        rev_by_test_facility = df.groupby(["Test_Name", "Facility_Type"])["Price"].sum().reset_index()
-        fig11 = px.bar(rev_by_test_facility.sort_values("Price", ascending=False).head(15),
-                       x="Test_Name", y="Price", color="Facility_Type", text="Price",
-                       barmode="group", title="Top Test Revenues by Facility Type")
-        fig11.update_layout(xaxis_title="Test Name", yaxis_title="Revenue", bargap=0.3)
-        st.plotly_chart(fig11, use_container_width=True, key="fig11_revenue_fac")
-        generate_download_link(rev_by_test_facility, "revenue_by_test_facility.csv")
-
 
 # === Delays & TAT === #
 with tabs[3]:
@@ -391,7 +392,7 @@ with tabs[3]:
         ]
 
         # --- Delay Distribution ---
-        st.subheader("📊 Distribution of Completion Delays")
+        st.subheader(f"📊 Distribution of Completion Delays ({df['Delay_Method'].iloc[0]})")
         fig10 = px.histogram(completed_df, x="Delay_Days", nbins=40, title="Delay Distribution (Days)")
         fig10.update_traces(marker_color="#4c78a8", marker_line_color="black", marker_line_width=0.5)
         fig10.update_layout(xaxis_title="Delay (Days)", yaxis_title="Test Count")
@@ -429,7 +430,7 @@ with tabs[3]:
 
         # --- Delay Table Preview ---
         st.subheader("📋 Delay Data Preview")
-        preview_cols = ["Submission_Release_Date", "Test_Name", "Client_Facility", "Analyst", "Delay_Days", "Rush"]
+        preview_cols = ["Submission_Release_Date", "Test_Name", "Client_Facility", "Analyst", "Delay_Days", "Rush", "Delay_Method"]
         preview_cols = [col for col in preview_cols if col in completed_df.columns]
         st.dataframe(completed_df[preview_cols].head(100))
 
@@ -438,6 +439,7 @@ with tabs[3]:
         generate_download_link(status_count, "ontime_vs_delayed.csv")
     else:
         st.warning("Delay and completion status columns not found in data.")
+
 
 # === Forecasting === #
 
