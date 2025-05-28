@@ -3,9 +3,17 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from prophet import Prophet
-from datetime import datetime
+from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
+
+# ========== Delay Helper (Only Skip Sundays) ==========
+def adjusted_calendar_delay(submit_date, est_date):
+    if pd.isna(submit_date) or pd.isna(est_date):
+        return pd.NaT
+    days = pd.date_range(start=submit_date + timedelta(days=1), end=est_date)
+    skipped = sum(1 for d in days if d.weekday() == 6)  # Skip only Sundays
+    return est_date - timedelta(days=skipped)
 
 # ========== Cached File Reader ==========
 @st.cache_data(show_spinner=False)
@@ -102,7 +110,7 @@ sample_search = st.sidebar.text_input("Search Sample Name")
 # ✅ Centralized Delay Toggle (shared across all tabs)
 delay_toggle = st.sidebar.radio(
     "Delay Calculation Method",
-    ["Adjusted (skip Sat & Sun)", "System ETC"],
+    ["Adjusted (skip Sundays only)", "System ETC"],
     horizontal=True,
     key="delay_method_toggle_main"
 )
@@ -148,17 +156,16 @@ tabs = st.tabs([
     "Statistical Insights"
 ])
 
-# === Executive Overview Tab === #
+
+# ========== Executive Overview Tab ==========
 with tabs[0]:
     st.header("Executive Overview")
 
     # --- KPI Metrics --- #
     col1, col2, col3, col4 = st.columns(4)
 
-    # 1. Total Active Tests (after filtering)
     col1.metric("Total Active Tests", f"{df.shape[0]:,}")
 
-    # 2. Revenue Metrics
     if "Price" in df.columns:
         col2.metric("Total Revenue", f"${df['Price'].sum():,.2f}")
         col3.metric("Avg Price/Test", f"${df['Price'].mean():.2f}")
@@ -166,16 +173,14 @@ with tabs[0]:
         col2.metric("Total Revenue", "N/A")
         col3.metric("Avg Price/Test", "N/A")
 
-    # --- Lost Revenue (Canceled) ---
     lost_revenue = 0
     if "Price" in canceled_df.columns:
         lost_revenue = canceled_df["Price"].sum()
-
     col4.metric("Lost Revenue (Canceled)", f"${lost_revenue:,.2f}", delta_color="inverse")
 
     # --- Top 5 Tests by Volume --- #
-st.subheader("Top 5 Tests by Volume")
-if "Test_Name" in df.columns:
+    st.subheader("Top 5 Tests by Volume")
+    if "Test_Name" in df.columns:
         top_tests = (
             df["Test_Name"]
             .value_counts()
@@ -190,8 +195,8 @@ if "Test_Name" in df.columns:
         generate_download_link(top_tests, "top_tests_volume.csv")
 
     # --- Top 5 Tests by Revenue --- #
-st.subheader("Top 5 Tests by Revenue")
-if "Test_Name" in df.columns and "Price" in df.columns:
+    st.subheader("Top 5 Tests by Revenue")
+    if "Test_Name" in df.columns and "Price" in df.columns:
         top_revenue = (
             df.groupby("Test_Name")["Price"]
             .sum()
@@ -208,8 +213,8 @@ if "Test_Name" in df.columns and "Price" in df.columns:
         generate_download_link(top_revenue, "top_tests_revenue.csv")
 
     # --- Revenue by Facility Type --- #
-st.subheader("\U0001F3ED Revenue by Facility Type")
-if "Facility_Type" in df.columns and "Price" in df.columns:
+    st.subheader("🏭 Revenue by Facility Type")
+    if "Facility_Type" in df.columns and "Price" in df.columns:
         rev_by_facility = df.groupby("Facility_Type")["Price"].sum().reset_index()
         fig3 = px.pie(
             rev_by_facility, names="Facility_Type", values="Price", hole=0.4,
@@ -218,6 +223,80 @@ if "Facility_Type" in df.columns and "Price" in df.columns:
         st.plotly_chart(fig3, use_container_width=True, key="fig3_facility_pie")
         generate_download_link(rev_by_facility, "revenue_by_facility_type.csv")
 
+
+# === Client Analysis === #
+with tabs[1]:
+    st.header("🏥 Client-Level Performance Analysis")
+
+    # --- KPIs --- #
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Total Clients", df["Client_Facility"].nunique() if "Client_Facility" in df.columns else 0)
+
+    if not df.empty and "Client_Facility" in df.columns and "Price" in df.columns:
+        top_client = df.groupby("Client_Facility")["Price"].sum().idxmax()
+    else:
+        top_client = "N/A"
+    col2.metric("Top Client by Revenue", top_client)
+
+    top_canceled_test = (
+        canceled_df["Test_Name"].value_counts().idxmax()
+        if not canceled_df.empty and "Test_Name" in canceled_df.columns else "N/A"
+    )
+    canceled_count = (
+        canceled_df["Test_Name"].value_counts().max()
+        if not canceled_df.empty and "Test_Name" in canceled_df.columns else 0
+    )
+    col3.metric("Top Canceled Test", f"{top_canceled_test} ({canceled_count})")
+
+    # --- Volume by Client --- #
+    st.subheader("🧪 Test Volume by Client")
+    if "Client_Facility" in df.columns:
+        volume_by_client = df["Client_Facility"].value_counts().reset_index(name="Test_Count").rename(columns={"index": "Client_Facility"})
+        fig4 = px.bar(volume_by_client.head(10), x="Client_Facility", y="Test_Count", text="Test_Count", title="Top Clients by Test Volume")
+        fig4.update_layout(yaxis_title="Number of Tests", xaxis_title="Client")
+        fig4.update_traces(marker_color="#4c78a8", textposition="outside")
+        st.plotly_chart(fig4, use_container_width=True, key="fig4_volume_client")
+        generate_download_link(volume_by_client, "volume_by_client.csv")
+
+    # --- Revenue by Client & Facility Type --- #
+    st.subheader("💰 Revenue by Client & Facility Type")
+    if all(col in df.columns for col in ["Client_Facility", "Facility_Type", "Price"]):
+        client_facility_rev = df.groupby(["Client_Facility", "Facility_Type"])["Price"].sum().reset_index()
+        client_facility_rev = client_facility_rev.sort_values("Price", ascending=False).head(10)
+        fig_fac = px.bar(
+            client_facility_rev,
+            x="Client_Facility", y="Price", color="Facility_Type", text="Price",
+            title="Top Clients by Revenue (Grouped by Facility Type)"
+        )
+        fig_fac.update_layout(yaxis_title="Revenue ($)", xaxis_title="Client")
+        st.plotly_chart(fig_fac, use_container_width=True, key="fig5_revenue_client_facility")
+        generate_download_link(client_facility_rev, "revenue_by_client_facility.csv")
+
+    # --- Top Clients by Canceled Test Volume --- #
+    st.subheader("📉 Top Clients by Number of Canceled Tests")
+    if "Client_Facility" in canceled_df.columns:
+        cancel_volume = (
+            canceled_df["Client_Facility"].value_counts()
+            .reset_index(name="Canceled Count")
+            .rename(columns={"index": "Client_Facility"})
+        )
+        fig6 = px.bar(
+            cancel_volume.head(10),
+            x="Client_Facility", y="Canceled Count", text="Canceled Count",
+            title="Top Clients by Canceled Test Volume"
+        )
+        fig6.update_traces(marker_color="#e45756", textposition="outside")
+        st.plotly_chart(fig6, use_container_width=True, key="fig6_cancel_volume")
+        generate_download_link(cancel_volume, "canceled_volume_by_client.csv")
+
+    # --- Top Tests per Client & Facility Type --- #
+    st.subheader("🔍 Top Tests per Client & Facility Type")
+    if all(col in df.columns for col in ["Client_Facility", "Facility_Type", "Test_Name"]):
+        test_client_group = df.groupby(["Client_Facility", "Facility_Type", "Test_Name"]).size().reset_index(name="Count")
+        top_tests_per_client = test_client_group.sort_values(["Client_Facility", "Count"], ascending=[True, False])
+        st.dataframe(top_tests_per_client)
+        generate_download_link(top_tests_per_client, "top_tests_by_client_facility.csv")
 
 # === Test Performance === #
 with tabs[2]:
@@ -290,7 +369,7 @@ with tabs[2]:
         generate_download_link(test_revenue_data, "test_revenue.csv")
 
     # === Avg Delay by Test ===
-    st.subheader(" Average Delay by Test")
+    st.subheader("Average Delay by Test")
     if all(col in df_temp.columns for col in ["Status", "Test_Name", "Delay_Days"]):
         completed_only = df_temp[df_temp["Status"] == "Completed"]
         delay_by_test = completed_only.groupby("Test_Name")["Delay_Days"].mean().dropna().reset_index()
@@ -324,6 +403,7 @@ with tabs[2]:
         st.markdown("### Full Analyst Performance Table")
         st.dataframe(analyst_test.sort_values("Volume", ascending=False).round(2))
         generate_download_link(analyst_test, "analyst_breakdown_by_test.csv")
+
 
 # === Delays & TAT === #
 with tabs[3]:
@@ -646,13 +726,3 @@ with tabs[5]:
         generate_download_link(facility_summary, "facility_summary.csv")
     else:
         st.warning("Missing columns: 'Facility_Type' or 'Price'")
-
-    # 5. Revenue Histogram
-    st.subheader("Revenue Distribution per Test")
-    if "Price" in filtered_df.columns:
-        fig = px.histogram(filtered_df, x="Price", nbins=50, title="Distribution of Test Prices", marginal="box")
-        fig.update_layout(bargap=0.1, height=400)
-        fig.update_traces(marker_line_width=0.6, marker_line_color="black")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("Missing column: 'Price'")
