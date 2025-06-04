@@ -2,18 +2,22 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from prophet import Prophet
-from datetime import datetime, timedelta
-from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
+from datetime import timedelta
+from prophet import Prophet
+from sklearn.linear_model import LinearRegression
 
-# ========== Delay Helper (Only Skip Sundays) ==========
-def adjusted_calendar_delay(submit_date, est_date):
+# ========== Delay Helper ==========
+def adjusted_calendar_delay(submit_date, est_date, skip_sundays=True):
+    """Calculate adjusted delay, skipping Sundays if enabled."""
     if pd.isna(submit_date) or pd.isna(est_date):
         return pd.NaT
-    days = pd.date_range(start=submit_date + timedelta(days=1), end=est_date)
-    skipped = sum(1 for d in days if d.weekday() == 6)  # Skip only Sundays
-    return est_date - timedelta(days=skipped)
+    if skip_sundays:
+        days = pd.date_range(start=submit_date + timedelta(days=1), end=est_date)
+        skipped = sum(1 for d in days if d.weekday() == 6)
+        return est_date - timedelta(days=skipped)
+    else:
+        return est_date
 
 # ========== Cached File Reader ==========
 @st.cache_data(show_spinner=False)
@@ -52,50 +56,32 @@ if not uploaded_files:
 df_list = []
 for file in uploaded_files:
     temp_df = load_file(file)
-
-    if "Submission_Release_Date" in temp_df.columns:
-        temp_df["Submission_Release_Date"] = pd.to_datetime(temp_df["Submission_Release_Date"], errors="coerce")
+    # Parse dates and numerics
+    for col in ["Submission_Release_Date", "Completion_Date", "Estimated_Completion_Date"]:
+        if col in temp_df.columns:
+            temp_df[col] = pd.to_datetime(temp_df[col], errors="coerce")
     if "Price" in temp_df.columns:
         temp_df["Price"] = pd.to_numeric(temp_df["Price"], errors="coerce")
-
     df_list.append(temp_df)
 
 df = pd.concat(df_list, ignore_index=True)
 df_raw = df.copy()
 
 # ========== Separate Canceled Data BEFORE Filtering ==========
-if "Status" in df.columns:
-    canceled_df = df[df["Status"] == "Canceled"].copy()
-    df = df[df["Status"] != "Canceled"].copy()
-else:
-    canceled_df = pd.DataFrame(columns=df.columns)
-
-# ========== Date Column Parsing ==========
-for col in ["Completion_Date", "Estimated_Completion_Date", "Submission_Release_Date"]:
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+canceled_df = df[df["Status"] == "Canceled"].copy()
+df = df[df["Status"] != "Canceled"].copy()
 
 # ========== Add Date Parts ==========
-if "Submission_Release_Date" in df.columns:
-    df["Week"] = df["Submission_Release_Date"].dt.isocalendar().week
-    df["Month"] = df["Submission_Release_Date"].dt.to_period("M").astype(str)
-    df["Quarter"] = df["Submission_Release_Date"].dt.to_period("Q").astype(str)
-    df["Year"] = df["Submission_Release_Date"].dt.year
-
-# ========== Compute Delay ==========
-if all(col in df.columns for col in ["Status", "Completion_Date", "Estimated_Completion_Date"]):
-    completed_mask = df["Status"] == "Completed"
-    df.loc[completed_mask, "Delay_Days"] = (
-        df.loc[completed_mask, "Completion_Date"] - df.loc[completed_mask, "Estimated_Completion_Date"]
-    ).dt.days
+df["Week"] = df["Submission_Release_Date"].dt.isocalendar().week
+df["Month"] = df["Submission_Release_Date"].dt.to_period("M").astype(str)
+df["Quarter"] = df["Submission_Release_Date"].dt.to_period("Q").astype(str)
+df["Year"] = df["Submission_Release_Date"].dt.year
 
 # ========== Sidebar Filters ==========
 st.sidebar.header("Filter Panel")
 
 def safe_multiselect(label, col):
-    if col in df.columns:
-        return st.sidebar.multiselect(label, sorted(df[col].dropna().unique()))
-    return []
+    return st.sidebar.multiselect(label, sorted(df[col].dropna().unique()))
 
 test_filter = safe_multiselect("Test Name", "Test_Name")
 client_filter = safe_multiselect("Client Facility", "Client_Facility")
@@ -107,28 +93,32 @@ hazardous_filter = safe_multiselect("Hazardous Drug", "Hazardous_Drug")
 status_filter = safe_multiselect("Test Status", "Status")
 sample_search = st.sidebar.text_input("Search Sample Name")
 
-# ✅ Centralized Delay Toggle (shared across all tabs)
+# ========== Delay Toggle ==========
 delay_toggle = st.sidebar.radio(
     "Delay Calculation Method",
     ["Adjusted (skip Sundays only)", "System ETC"],
     horizontal=True,
     key="delay_method_toggle_main"
 )
+skip_sundays = delay_toggle == "Adjusted (skip Sundays only)"
 
 # ========== Date Range Filter ==========
-if "Submission_Release_Date" in df.columns:
-    min_date = df["Submission_Release_Date"].min()
-    max_date = df["Submission_Release_Date"].max()
-    st.sidebar.markdown("### Release Date Filter")
-    start_date = st.sidebar.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
-    end_date = st.sidebar.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
+min_date = df["Submission_Release_Date"].min()
+max_date = df["Submission_Release_Date"].max()
+st.sidebar.markdown("### Release Date Filter")
+start_date = st.sidebar.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
+end_date = st.sidebar.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
 
-    df = df[
-        (df["Submission_Release_Date"] >= pd.to_datetime(start_date)) &
-        (df["Submission_Release_Date"] <= pd.to_datetime(end_date))
-    ]
+# ========== Reset Filters Button ==========
+if st.sidebar.button("Reset Filters"):
+    st.rerun()
 
 # ========== Apply Filters ==========
+df = df[
+    (df["Submission_Release_Date"] >= pd.to_datetime(start_date)) &
+    (df["Submission_Release_Date"] <= pd.to_datetime(end_date))
+]
+
 filter_conditions = [
     ("Test_Name", test_filter),
     ("Client_Facility", client_filter),
@@ -143,8 +133,19 @@ for col, selected in filter_conditions:
     if selected:
         df = df[df[col].isin(selected)]
 
-if sample_search and "Sample_Name" in df.columns:
+if sample_search:
     df = df[df["Sample_Name"].astype(str).str.contains(sample_search, case=False, na=False)]
+
+# ========== Compute Delay (Consistent Everywhere) ==========
+completed_mask = df["Status"] == "Completed"
+df.loc[completed_mask, "Adj_Est_Completion"] = df.loc[completed_mask].apply(
+    lambda row: adjusted_calendar_delay(
+        row["Submission_Release_Date"], row["Estimated_Completion_Date"], skip_sundays=skip_sundays
+    ), axis=1
+)
+df.loc[completed_mask, "Delay_Days"] = (
+    df.loc[completed_mask, "Completion_Date"] - df.loc[completed_mask, "Adj_Est_Completion"]
+).dt.days
 
 # ========== Tabs ==========
 tabs = st.tabs([
@@ -156,366 +157,702 @@ tabs = st.tabs([
     "Statistical Insights"
 ])
 
+#Executive Tab
 
-# ========== Executive Overview Tab ==========
 with tabs[0]:
-    st.header("Executive Overview")
+    st.markdown(
+        """
+        <div style="background-color:#f0f2f6;padding:1.2rem;border-radius:10px;margin-bottom:1.5rem;">
+        <span style="font-size:1.2rem; color:#4c78a8;">
+        <b>ℹ️ Executive Overview:</b> All metrics and charts below are based on <b>all available data</b> and are <u>not affected by sidebar filters</u>.
+        </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown("## :bar_chart: Executive Overview")
 
     # --- KPI Metrics --- #
-    col1, col2, col3, col4 = st.columns(4)
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("🧪 Total Active Tests", f"{df_raw.shape[0]:,}")
+    kpi2.metric("💰 Total Revenue", f"${df_raw['Price'].sum():,.2f}")
+    kpi3.metric("📊 Avg Price/Test", f"${df_raw['Price'].mean():.2f}")
+    lost_revenue = canceled_df["Price"].sum()
+    kpi4.metric("❌ Lost Revenue (Canceled)", f"${lost_revenue:,.2f}", delta_color="inverse")
 
-    col1.metric("Total Active Tests", f"{df.shape[0]:,}")
-
-    if "Price" in df.columns:
-        col2.metric("Total Revenue", f"${df['Price'].sum():,.2f}")
-        col3.metric("Avg Price/Test", f"${df['Price'].mean():.2f}")
-    else:
-        col2.metric("Total Revenue", "N/A")
-        col3.metric("Avg Price/Test", "N/A")
-
-    lost_revenue = 0
-    if "Price" in canceled_df.columns:
-        lost_revenue = canceled_df["Price"].sum()
-    col4.metric("Lost Revenue (Canceled)", f"${lost_revenue:,.2f}", delta_color="inverse")
+    st.markdown("---")
 
     # --- Top 5 Tests by Volume --- #
-    st.subheader("Top 5 Tests by Volume")
-    if "Test_Name" in df.columns:
-        top_tests = (
-            df["Test_Name"]
-            .value_counts()
-            .nlargest(5)
-            .reset_index(name="Count")
-            .rename(columns={"index": "Test_Name"})
-        )
-        fig1 = px.bar(top_tests, x="Test_Name", y="Count", text="Count", title="Top Tests by Volume")
-        fig1.update_traces(marker_color="#4c78a8", textposition="outside")
-        fig1.update_layout(yaxis_title="Test Count", xaxis_title="Test Name")
-        st.plotly_chart(fig1, use_container_width=True, key="fig1_volume")
-        generate_download_link(top_tests, "top_tests_volume.csv")
+    st.markdown("#### 🏆 Top 5 Tests by Volume")
+    top_tests = (
+        df_raw[df_raw["Status"] != "Canceled"]["Test_Name"]
+        .value_counts()
+        .nlargest(5)
+        .reset_index(name="Count")
+        .rename(columns={"index": "Test_Name"})
+    )
+    fig1 = px.bar(
+        top_tests, x="Test_Name", y="Count", text="Count",
+        color="Test_Name", color_discrete_sequence=px.colors.qualitative.Pastel,
+        title="Top 5 Tests by Volume"
+    )
+    fig1.update_traces(textposition="outside")
+    fig1.update_layout(yaxis_title="Test Count", xaxis_title="Test Name", showlegend=False)
+    st.plotly_chart(fig1, use_container_width=True, key="exec_top_tests_volume")
+    generate_download_link(top_tests, "top_tests_volume.csv")
 
     # --- Top 5 Tests by Revenue --- #
-    st.subheader("Top 5 Tests by Revenue")
-    if "Test_Name" in df.columns and "Price" in df.columns:
-        top_revenue = (
-            df.groupby("Test_Name")["Price"]
-            .sum()
-            .nlargest(5)
-            .reset_index()
-        )
-        fig2 = px.bar(
-            top_revenue, x="Test_Name", y="Price", text="Price",
-            title="Top Tests by Revenue", labels={"Price": "Revenue"}
-        )
-        fig2.update_traces(marker_color="#59a14f", texttemplate="$%{text:.2f}", textposition="outside")
-        fig2.update_layout(yaxis_title="Total Revenue", xaxis_title="Test Name")
-        st.plotly_chart(fig2, use_container_width=True, key="fig2_top_revenue")
-        generate_download_link(top_revenue, "top_tests_revenue.csv")
+    st.markdown("#### 💵 Top 5 Tests by Revenue")
+    top_revenue = (
+        df_raw[df_raw["Status"] != "Canceled"]
+        .groupby("Test_Name")["Price"]
+        .sum()
+        .nlargest(5)
+        .reset_index()
+    )
+    fig2 = px.bar(
+        top_revenue, x="Test_Name", y="Price", text="Price",
+        color="Test_Name", color_discrete_sequence=px.colors.qualitative.Set2,
+        title="Top 5 Tests by Revenue"
+    )
+    fig2.update_traces(texttemplate="$%{text:,.2f}", textposition="outside")
+    fig2.update_layout(yaxis_title="Total Revenue", xaxis_title="Test Name", showlegend=False)
+    st.plotly_chart(fig2, use_container_width=True, key="exec_top_tests_revenue")
+    generate_download_link(top_revenue, "top_tests_revenue.csv")
 
     # --- Revenue by Facility Type --- #
-    st.subheader("🏭 Revenue by Facility Type")
-    if "Facility_Type" in df.columns and "Price" in df.columns:
-        rev_by_facility = df.groupby("Facility_Type")["Price"].sum().reset_index()
-        fig3 = px.pie(
-            rev_by_facility, names="Facility_Type", values="Price", hole=0.4,
-            title="Revenue Contribution by Facility Type"
-        )
-        st.plotly_chart(fig3, use_container_width=True, key="fig3_facility_pie")
-        generate_download_link(rev_by_facility, "revenue_by_facility_type.csv")
+    st.markdown("#### 🏭 Revenue by Facility Type")
+    rev_by_facility = (
+        df_raw[df_raw["Status"] != "Canceled"]
+        .groupby("Facility_Type")["Price"].sum().reset_index()
+    )
+    fig3 = px.pie(
+        rev_by_facility, names="Facility_Type", values="Price", hole=0.45,
+        color_discrete_sequence=px.colors.sequential.RdBu,
+        title="Revenue Contribution by Facility Type"
+    )
+    fig3.update_traces(textinfo='percent+label')
+    st.plotly_chart(fig3, use_container_width=True, key="exec_revenue_by_facility")
+    generate_download_link(rev_by_facility, "revenue_by_facility_type.csv")
+
+    # --- Top 5 Cancelled Tests --- #
+    st.markdown("#### ❌ Top 5 Cancelled Tests")
+    top_cancelled = (
+        canceled_df["Test_Name"]
+        .value_counts()
+        .nlargest(5)
+        .reset_index(name="Canceled_Count")
+        .rename(columns={"index": "Test_Name"})
+    )
+    fig4 = px.bar(
+        top_cancelled, x="Test_Name", y="Canceled_Count", text="Canceled_Count",
+        color="Test_Name", color_discrete_sequence=px.colors.qualitative.Safe,
+        title="Top 5 Cancelled Tests"
+    )
+    fig4.update_traces(marker_color="#e45756", textposition="outside")
+    fig4.update_layout(yaxis_title="Canceled Count", xaxis_title="Test Name", showlegend=False)
+    st.plotly_chart(fig4, use_container_width=True, key="exec_top_cancelled_tests")
+    generate_download_link(top_cancelled, "top_cancelled_tests.csv")
+
+    st.markdown(
+        """
+        <style>
+        .stMetric {background-color: #f8fafc; border-radius: 10px; padding: 10px;}
+        .stPlotlyChart {background-color: #fff; border-radius: 10px; padding: 10px;}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
 
-# === Client Analysis === #
+# Client Analysis
+
 with tabs[1]:
-    st.header("🏥 Client-Level Performance Analysis")
+    st.markdown(
+        """
+        <div style="background-color:#f0f2f6;padding:1.2rem;border-radius:10px;margin-bottom:1.5rem;">
+        <span style="font-size:1.2rem; color:#4c78a8;">
+        <b>ℹ️ Client Analysis:</b> All metrics and charts below reflect <b>current filters</b> and date range.
+        </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown("## :busts_in_silhouette: Client-Level Performance Analysis")
 
     # --- KPIs --- #
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Total Clients", df["Client_Facility"].nunique() if "Client_Facility" in df.columns else 0)
-
-    if not df.empty and "Client_Facility" in df.columns and "Price" in df.columns:
-        top_client = df.groupby("Client_Facility")["Price"].sum().idxmax()
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("👥 Total Clients", df["Client_Facility"].nunique())
+    if not df.empty:
+        top_client_rev = df.groupby("Client_Facility")["Price"].sum().idxmax()
+        top_client_vol = df["Client_Facility"].value_counts().idxmax()
     else:
-        top_client = "N/A"
-    col2.metric("Top Client by Revenue", top_client)
+        top_client_rev = "N/A"
+        top_client_vol = "N/A"
+    kpi2.metric("💰 Top Client by Revenue", top_client_rev)
+    kpi3.metric("🧪 Top Client by Volume", top_client_vol)
+    if not canceled_df.empty:
+        top_client_cancel = canceled_df["Client_Facility"].value_counts().idxmax()
+    else:
+        top_client_cancel = "N/A"
+    kpi4.metric("❌ Top Client by Cancelling", top_client_cancel)
 
-    top_canceled_test = (
-        canceled_df["Test_Name"].value_counts().idxmax()
-        if not canceled_df.empty and "Test_Name" in canceled_df.columns else "N/A"
+    st.markdown("---")
+
+    # --- Top 10 Clients by Revenue --- #
+    st.markdown("#### 💵 Top 10 Clients by Revenue")
+    top10_rev = (
+        df.groupby("Client_Facility")["Price"].sum()
+        .nlargest(10)
+        .reset_index()
+        .rename(columns={"Price": "Total Revenue"})
     )
-    canceled_count = (
-        canceled_df["Test_Name"].value_counts().max()
-        if not canceled_df.empty and "Test_Name" in canceled_df.columns else 0
+    fig1 = px.bar(
+        top10_rev, x="Client_Facility", y="Total Revenue", text="Total Revenue",
+        color="Client_Facility", color_discrete_sequence=px.colors.qualitative.Set2,
+        title="Top 10 Clients by Revenue"
     )
-    col3.metric("Top Canceled Test", f"{top_canceled_test} ({canceled_count})")
+    fig1.update_traces(texttemplate="$%{text:,.2f}", textposition="outside")
+    fig1.update_layout(yaxis_title="Total Revenue", xaxis_title="Client", showlegend=False)
+    st.plotly_chart(fig1, use_container_width=True, key="client_top10_revenue")
+    generate_download_link(top10_rev, "top10_clients_by_revenue.csv")
 
-    # --- Volume by Client --- #
-    st.subheader("🧪 Test Volume by Client")
-    if "Client_Facility" in df.columns:
-        volume_by_client = df["Client_Facility"].value_counts().reset_index(name="Test_Count").rename(columns={"index": "Client_Facility"})
-        fig4 = px.bar(volume_by_client.head(10), x="Client_Facility", y="Test_Count", text="Test_Count", title="Top Clients by Test Volume")
-        fig4.update_layout(yaxis_title="Number of Tests", xaxis_title="Client")
-        fig4.update_traces(marker_color="#4c78a8", textposition="outside")
-        st.plotly_chart(fig4, use_container_width=True, key="fig4_volume_client")
-        generate_download_link(volume_by_client, "volume_by_client.csv")
+    # --- Top 10 Clients by Volume --- #
+    st.markdown("#### 🧪 Top 10 Clients by Volume")
+    top10_vol = (
+        df["Client_Facility"].value_counts()
+        .head(10)
+        .reset_index(name="Test Volume")
+    )
+    fig2 = px.bar(
+        top10_vol, x="Client_Facility", y="Test Volume", text="Test Volume",
+        color="Client_Facility", color_discrete_sequence=px.colors.qualitative.Pastel,
+        title="Top 10 Clients by Test Volume"
+    )
+    fig2.update_traces(textposition="outside")
+    fig2.update_layout(yaxis_title="Test Volume", xaxis_title="Client", showlegend=False)
+    st.plotly_chart(fig2, use_container_width=True, key="client_top10_volume")
+    generate_download_link(top10_vol, "top10_clients_by_volume.csv")
 
-    # --- Revenue by Client & Facility Type --- #
-    st.subheader("💰 Revenue by Client & Facility Type")
-    if all(col in df.columns for col in ["Client_Facility", "Facility_Type", "Price"]):
-        client_facility_rev = df.groupby(["Client_Facility", "Facility_Type"])["Price"].sum().reset_index()
-        client_facility_rev = client_facility_rev.sort_values("Price", ascending=False).head(10)
-        fig_fac = px.bar(
-            client_facility_rev,
-            x="Client_Facility", y="Price", color="Facility_Type", text="Price",
-            title="Top Clients by Revenue (Grouped by Facility Type)"
+    # --- Top 10 Clients by Cancellations --- #
+    st.markdown("#### ❌ Top 10 Clients by Cancellations")
+    top10_cancel = (
+        canceled_df["Client_Facility"].value_counts()
+        .head(10)
+        .reset_index(name="Canceled Count")
+    )
+    fig3 = px.bar(
+        top10_cancel, x="Client_Facility", y="Canceled Count", text="Canceled Count",
+        color="Client_Facility", color_discrete_sequence=px.colors.qualitative.Safe,
+        title="Top 10 Clients by Canceled Tests"
+    )
+    fig3.update_traces(marker_color="#e45756", textposition="outside")
+    fig3.update_layout(yaxis_title="Canceled Count", xaxis_title="Client", showlegend=False)
+    st.plotly_chart(fig3, use_container_width=True, key="client_top10_cancellations")
+    generate_download_link(top10_cancel, "top10_clients_by_cancellations.csv")
+
+    st.markdown("---")
+
+    # --- Growth Analysis Toggle --- #
+    st.markdown("#### 📈 Top 10 Growing Clients (by Volume & Revenue)")
+    growth_window = st.radio(
+        "Select Growth Window:",
+        options=[3, 6, 12],
+        format_func=lambda x: f"Last {x} Months vs Previous {x} Months",
+        horizontal=True,
+        key="growth_window_toggle"
+    )
+
+    if df["Submission_Release_Date"].notna().any():
+        most_recent_date = df["Submission_Release_Date"].max()
+        cutoff_recent = most_recent_date - pd.DateOffset(months=growth_window)
+        cutoff_prev = cutoff_recent - pd.DateOffset(months=growth_window)
+
+        recent_period = df[(df["Submission_Release_Date"] > cutoff_recent)]
+        prev_period = df[
+            (df["Submission_Release_Date"] > cutoff_prev) &
+            (df["Submission_Release_Date"] <= cutoff_recent)
+        ]
+
+        # --- By Volume ---
+        recent_vol = recent_period.groupby("Client_Facility").size().rename("Recent Volume")
+        prev_vol = prev_period.groupby("Client_Facility").size().rename("Prev Volume")
+        growth_vol = pd.concat([recent_vol, prev_vol], axis=1).fillna(0)
+        growth_vol["Abs Growth"] = growth_vol["Recent Volume"] - growth_vol["Prev Volume"]
+        growth_vol["% Growth"] = np.where(
+            growth_vol["Prev Volume"] == 0,
+            np.nan,
+            100 * growth_vol["Abs Growth"] / growth_vol["Prev Volume"]
         )
-        fig_fac.update_layout(yaxis_title="Revenue ($)", xaxis_title="Client")
-        st.plotly_chart(fig_fac, use_container_width=True, key="fig5_revenue_client_facility")
-        generate_download_link(client_facility_rev, "revenue_by_client_facility.csv")
+        growth_vol = growth_vol.reset_index()
+        growth_vol = growth_vol.sort_values("Abs Growth", ascending=False).head(10)
 
-    # --- Top Clients by Canceled Test Volume --- #
-    st.subheader("📉 Top Clients by Number of Canceled Tests")
-    if "Client_Facility" in canceled_df.columns:
-        cancel_volume = (
-            canceled_df["Client_Facility"].value_counts()
-            .reset_index(name="Canceled Count")
-            .rename(columns={"index": "Client_Facility"})
+        # --- By Revenue ---
+        recent_rev = recent_period.groupby("Client_Facility")["Price"].sum().rename("Recent Revenue")
+        prev_rev = prev_period.groupby("Client_Facility")["Price"].sum().rename("Prev Revenue")
+        growth_rev = pd.concat([recent_rev, prev_rev], axis=1).fillna(0)
+        growth_rev["Abs Growth"] = growth_rev["Recent Revenue"] - growth_rev["Prev Revenue"]
+        growth_rev["% Growth"] = np.where(
+            growth_rev["Prev Revenue"] == 0,
+            np.nan,
+            100 * growth_rev["Abs Growth"] / growth_rev["Prev Revenue"]
         )
-        fig6 = px.bar(
-            cancel_volume.head(10),
-            x="Client_Facility", y="Canceled Count", text="Canceled Count",
-            title="Top Clients by Canceled Test Volume"
-        )
-        fig6.update_traces(marker_color="#e45756", textposition="outside")
-        st.plotly_chart(fig6, use_container_width=True, key="fig6_cancel_volume")
-        generate_download_link(cancel_volume, "canceled_volume_by_client.csv")
+        growth_rev = growth_rev.reset_index()
+        growth_rev = growth_rev.sort_values("Abs Growth", ascending=False).head(10)
 
-    # --- Top Tests per Client & Facility Type --- #
-    st.subheader("🔍 Top Tests per Client & Facility Type")
-    if all(col in df.columns for col in ["Client_Facility", "Facility_Type", "Test_Name"]):
-        test_client_group = df.groupby(["Client_Facility", "Facility_Type", "Test_Name"]).size().reset_index(name="Count")
-        top_tests_per_client = test_client_group.sort_values(["Client_Facility", "Count"], ascending=[True, False])
-        st.dataframe(top_tests_per_client)
-        generate_download_link(top_tests_per_client, "top_tests_by_client_facility.csv")
+        # --- Growth Volume Chart ---
+        st.markdown("##### 🚀 Top 10 Clients by Volume Growth")
+        fig_grow_vol = px.bar(
+            growth_vol, x="Client_Facility", y="Abs Growth", text="Abs Growth",
+            color="Client_Facility", color_discrete_sequence=px.colors.qualitative.Bold,
+            hover_data={"% Growth": ":.2f"},
+            title="Top 10 Clients by Absolute Volume Growth"
+        )
+        fig_grow_vol.update_traces(textposition="outside")
+        fig_grow_vol.update_layout(yaxis_title="Absolute Growth", xaxis_title="Client", showlegend=False)
+        st.plotly_chart(fig_grow_vol, use_container_width=True, key="client_top10_grow_volume")
+        st.dataframe(
+            growth_vol[["Client_Facility", "Recent Volume", "Prev Volume", "Abs Growth", "% Growth"]]
+            .rename(columns={"Abs Growth": "Absolute Growth", "% Growth": "Percent Growth (%)"})
+            .replace({np.nan: "N/A"})
+            .round(2),
+            use_container_width=True
+        )
+        generate_download_link(
+            growth_vol[["Client_Facility", "Recent Volume", "Prev Volume", "Abs Growth", "% Growth"]],
+            "top10_clients_by_volume_growth.csv"
+        )
+
+        # --- Growth Revenue Chart ---
+        st.markdown("##### 💹 Top 10 Clients by Revenue Growth")
+        fig_grow_rev = px.bar(
+            growth_rev, x="Client_Facility", y="Abs Growth", text="Abs Growth",
+            color="Client_Facility", color_discrete_sequence=px.colors.qualitative.Prism,
+            hover_data={"% Growth": ":.2f"},
+            title="Top 10 Clients by Absolute Revenue Growth"
+        )
+        fig_grow_rev.update_traces(textposition="outside")
+        fig_grow_rev.update_layout(yaxis_title="Absolute Growth ($)", xaxis_title="Client", showlegend=False)
+        st.plotly_chart(fig_grow_rev, use_container_width=True, key="client_top10_grow_revenue")
+        st.dataframe(
+            growth_rev[["Client_Facility", "Recent Revenue", "Prev Revenue", "Abs Growth", "% Growth"]]
+            .rename(columns={"Abs Growth": "Absolute Growth", "% Growth": "Percent Growth (%)"})
+            .replace({np.nan: "N/A"})
+            .round(2),
+            use_container_width=True
+        )
+        generate_download_link(
+            growth_rev[["Client_Facility", "Recent Revenue", "Prev Revenue", "Abs Growth", "% Growth"]],
+            "top10_clients_by_revenue_growth.csv"
+        )
+    else:
+        st.info("Not enough date data to calculate growth trends.")
+
+    st.markdown(
+        """
+        <style>
+        .stMetric {background-color: #f8fafc; border-radius: 10px; padding: 10px;}
+        .stPlotlyChart {background-color: #fff; border-radius: 10px; padding: 10px;}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
 # === Test Performance === #
 with tabs[2]:
-    st.header("Test-Level Performance")
+    st.markdown(
+        """
+        <div style="background-color:#f0f2f6;padding:1.2rem;border-radius:10px;margin-bottom:1.5rem;">
+        <span style="font-size:1.2rem; color:#4c78a8;">
+        <b>ℹ️ Test Performance:</b> All metrics and charts below reflect <b>current filters</b> and date range.
+        </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    from datetime import timedelta
+    st.markdown("## :microscope: Test Performance Dashboard")
 
-    # --- Safe delay calculator function --- #
-    def adjusted_calendar_delay(submit_date, est_date):
-        if pd.isna(submit_date) or pd.isna(est_date):
-            return pd.NaT
-        days = pd.date_range(start=submit_date + timedelta(days=1), end=est_date)
-        skipped = sum(1 for d in days if d.weekday() in [5, 6])
-        return est_date - timedelta(days=skipped)
+    # --- KPIs --- #
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("🔬 Unique Tests", df["Test_Name"].nunique())
+    k2.metric("🧪 Total Test Volume", df.shape[0])
+    k3.metric("💰 Total Revenue by Test", f"${df['Price'].sum():,.2f}")
+    lost_rev_by_test = canceled_df.groupby("Test_Name")["Price"].sum() if not canceled_df.empty else pd.Series(dtype=float)
+    k4.metric("❌ Lost Revenue by Test (Total)", f"${lost_rev_by_test.sum():,.2f}")
 
-    # --- Copy filtered df for local use --- #
-    df_temp = df.copy()
+    k5, k6, k7, k8 = st.columns(4)
+    avg_rev = df.groupby("Test_Name")["Price"].mean().mean() if not df.empty else 0
+    k5.metric("📊 Avg Revenue/Test", f"${avg_rev:,.2f}")
 
-    if all(col in df_temp.columns for col in ["Submission_Release_Date", "Estimated_Completion_Date", "Completion_Date"]):
-        df_temp = df_temp.dropna(subset=["Submission_Release_Date", "Estimated_Completion_Date", "Completion_Date"]).copy()
+    most_performed = df["Test_Name"].value_counts().idxmax() if not df.empty else "N/A"
+    k6.metric("🏆 Most Performed Test", most_performed)
 
-        if delay_toggle == "Adjusted (skip Sat & Sun)":
-            df_temp["Expected_Completion"] = df_temp.apply(
-                lambda row: adjusted_calendar_delay(row["Submission_Release_Date"], row["Estimated_Completion_Date"]),
-                axis=1
-            )
-        else:
-            df_temp["Expected_Completion"] = df_temp["Estimated_Completion_Date"]
+    most_profitable = df.groupby("Test_Name")["Price"].sum().idxmax() if not df.empty else "N/A"
+    k7.metric("💸 Most Profitable Test", most_profitable)
 
-        df_temp["Delay_Days"] = (df_temp["Completion_Date"] - df_temp["Expected_Completion"]).dt.days
-        df_temp["Delay_Method"] = delay_toggle
-
-    # === KPIs ===
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Unique Tests", df_temp["Test_Name"].nunique() if "Test_Name" in df_temp.columns else 0)
-
-    if not df_temp.empty and "Test_Name" in df_temp.columns and "Price" in df_temp.columns:
-        top_test = df_temp.groupby("Test_Name")["Price"].sum().idxmax()
+    if not lost_rev_by_test.empty:
+        test_most_lost = lost_rev_by_test.idxmax()
     else:
-        top_test = "N/A"
-    col2.metric("Top Revenue-Generating Test", top_test)
+        test_most_lost = "N/A"
+    k8.metric("❗Test with Most Lost Revenue", test_most_lost)
 
-    if not df_temp.empty and all(col in df_temp.columns for col in ["Status", "Delay_Days", "Test_Name"]):
-        completed_df = df_temp[df_temp["Status"] == "Completed"]
-        if not completed_df.empty:
-            delayed_test_avg = completed_df.groupby("Test_Name")["Delay_Days"].mean().sort_values(ascending=False)
-            most_delayed_test = delayed_test_avg.idxmax() if not delayed_test_avg.empty else "N/A"
-        else:
-            most_delayed_test = "N/A"
+    # --- Top 10 Tests by Volume --- #
+    st.markdown("#### 🧪 Top 10 Tests by Volume")
+    top10_vol = (
+        df["Test_Name"].value_counts()
+        .head(10)
+        .reset_index(name="Volume")
+        .rename(columns={"index": "Test_Name"})
+    )
+    fig_vol = px.bar(
+        top10_vol, x="Test_Name", y="Volume", text="Volume",
+        color="Test_Name", color_discrete_sequence=px.colors.qualitative.Pastel,
+        title="Top 10 Tests by Volume"
+    )
+    fig_vol.update_traces(textposition="outside")
+    fig_vol.update_layout(yaxis_title="Test Volume", xaxis_title="Test Name", showlegend=False)
+    st.plotly_chart(fig_vol, use_container_width=True, key="test_top10_volume")
+    generate_download_link(top10_vol, "top10_tests_by_volume.csv")
+
+    # --- Top 10 Tests by Revenue --- #
+    st.markdown("#### 💵 Top 10 Tests by Revenue")
+    top10_rev = (
+        df.groupby("Test_Name")["Price"].sum().nlargest(10).reset_index()
+        .rename(columns={"Price": "Total Revenue"})
+    )
+    fig_rev = px.bar(
+        top10_rev, x="Test_Name", y="Total Revenue", text="Total Revenue",
+        color="Test_Name", color_discrete_sequence=px.colors.qualitative.Set2,
+        title="Top 10 Tests by Revenue"
+    )
+    fig_rev.update_traces(texttemplate="$%{text:,.2f}", textposition="outside")
+    fig_rev.update_layout(yaxis_title="Total Revenue", xaxis_title="Test Name", showlegend=False)
+    st.plotly_chart(fig_rev, use_container_width=True, key="test_top10_revenue")
+    generate_download_link(top10_rev, "top10_tests_by_revenue.csv")
+
+    # --- Top 10 Tests by Lost Revenue --- #
+    st.markdown("#### ❌ Top 10 Tests by Lost Revenue (Canceled)")
+    if not canceled_df.empty:
+        lost_rev_by_test = (
+            canceled_df.groupby("Test_Name")["Price"].sum().nlargest(10).reset_index()
+            .rename(columns={"Price": "Lost Revenue"})
+        )
+        fig_lost = px.bar(
+            lost_rev_by_test, x="Test_Name", y="Lost Revenue", text="Lost Revenue",
+            color="Test_Name", color_discrete_sequence=px.colors.qualitative.Safe,
+            title="Top 10 Tests by Lost Revenue"
+        )
+        fig_lost.update_traces(marker_color="#e45756", textposition="outside")
+        fig_lost.update_layout(yaxis_title="Lost Revenue", xaxis_title="Test Name", showlegend=False)
+        st.plotly_chart(fig_lost, use_container_width=True, key="test_top10_lost_revenue")
+        generate_download_link(lost_rev_by_test, "top10_tests_by_lost_revenue.csv")
     else:
-        most_delayed_test = "N/A"
-    col3.metric("Most Delayed Test (Avg)", most_delayed_test)
+        st.info("No canceled tests in current filters.")
 
-    # === Volume by Test ===
-    st.subheader("Volume by Test")
-    if "Test_Name" in df_temp.columns:
-        test_volume = df_temp["Test_Name"].value_counts().reset_index(name="Volume").rename(columns={"index": "Test_Name"})
-        fig7 = px.bar(test_volume.head(10), x="Test_Name", y="Volume", text="Volume", title="Top 10 Tests by Volume")
-        fig7.update_traces(marker_color="#4c78a8", textposition="outside")
-        st.plotly_chart(fig7, use_container_width=True, key="fig7_volume")
-        generate_download_link(test_volume, "test_volume.csv")
-
-    # === Revenue by Test ===
-    st.subheader("Revenue by Test")
-    if all(col in df_temp.columns for col in ["Test_Name", "Price"]):
-        test_revenue_data = df_temp.groupby("Test_Name")["Price"].sum().nlargest(10).reset_index()
-        fig8 = px.bar(test_revenue_data, x="Test_Name", y="Price", text="Price", title="Top 10 Revenue-Generating Tests")
-        fig8.update_traces(marker_color="#59a14f", texttemplate="$%{text:.2f}", textposition="outside")
-        st.plotly_chart(fig8, use_container_width=True, key="fig8_revenue")
-        generate_download_link(test_revenue_data, "test_revenue.csv")
-
-    # === Avg Delay by Test ===
-    st.subheader("Average Delay by Test")
-    if all(col in df_temp.columns for col in ["Status", "Test_Name", "Delay_Days"]):
-        completed_only = df_temp[df_temp["Status"] == "Completed"]
-        delay_by_test = completed_only.groupby("Test_Name")["Delay_Days"].mean().dropna().reset_index()
-        fig9 = px.bar(
-            delay_by_test.sort_values("Delay_Days", ascending=False).head(10),
-            x="Test_Name", y="Delay_Days", text="Delay_Days", title="Most Delayed Tests"
+    # --- Rush vs Non-Rush Volume Comparison --- #
+    st.markdown("#### ⚡ Rush vs Non-Rush Test Volume")
+    if "Rush" in df.columns:
+        rush_counts = (
+            df.groupby(["Test_Name", "Rush"]).size().unstack(fill_value=0)
+            .reset_index().rename_axis(None, axis=1)
         )
-        fig9.update_traces(marker_color="#f28e2b", textposition="outside")
-        st.plotly_chart(fig9, use_container_width=True, key="fig9_delay")
-        generate_download_link(delay_by_test, "average_delay_by_test.csv")
-
-    # === Analyst Breakdown ===
-    st.subheader("Analyst Breakdown by Test")
-    if all(col in df_temp.columns for col in ["Test_Name", "Analyst", "Price", "Delay_Days"]):
-        analyst_test = df_temp.groupby("Analyst").agg(
-            Total_Revenue=("Price", "sum"),
-            Avg_Delay=("Delay_Days", "mean"),
-            Volume=("Test_Name", "count")
-        ).reset_index()
-
-        st.markdown("### Test Volume by Analyst")
-        fig_bar = px.bar(
-            analyst_test.sort_values("Volume", ascending=False),
-            x="Analyst", y="Volume", text="Volume",
-            title="Total Test Volume Handled by Analyst"
+        # Ensure both columns 'Y' and 'N' exist for plotting
+        for col in ['Y', 'N']:
+            if col not in rush_counts.columns:
+                rush_counts[col] = 0
+        rush_counts = rush_counts.sort_values(by=["Y"], ascending=False).head(10)
+        fig_rush = px.bar(
+            rush_counts, x="Test_Name", y=["Y", "N"],
+            title="Top 10 Tests: Rush vs Non-Rush Volume",
+            labels={"value": "Test Volume", "variable": "Rush Status"},
+            barmode="group",
+            color_discrete_sequence=["#f28e2b", "#4c78a8"]
         )
-        fig_bar.update_traces(marker_color="#4c78a8", textposition="outside")
-        fig_bar.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_rush, use_container_width=True, key="test_rush_nonrush")
+        generate_download_link(rush_counts, "rush_vs_nonrush_by_test.csv")
+    else:
+        st.info("No Rush data available.")
 
-        st.markdown("### Full Analyst Performance Table")
-        st.dataframe(analyst_test.sort_values("Volume", ascending=False).round(2))
-        generate_download_link(analyst_test, "analyst_breakdown_by_test.csv")
+    # --- Fastest Growing Tests by Volume --- #
+    st.markdown("#### 🚀 Fastest Growing Tests by Volume")
+    growth_window = st.radio(
+        "Select Growth Window:",
+        options=[3, 6, 12],
+        format_func=lambda x: f"Last {x} Months vs Previous {x} Months",
+        horizontal=True,
+        key="test_growth_window"
+    )
+    if df["Submission_Release_Date"].notna().any():
+        most_recent_date = df["Submission_Release_Date"].max()
+        cutoff_recent = most_recent_date - pd.DateOffset(months=growth_window)
+        cutoff_prev = cutoff_recent - pd.DateOffset(months=growth_window)
 
+        recent_period = df[df["Submission_Release_Date"] > cutoff_recent]
+        prev_period = df[(df["Submission_Release_Date"] > cutoff_prev) & (df["Submission_Release_Date"] <= cutoff_recent)]
 
-# === Delays & TAT === #
+        recent_vol = recent_period.groupby("Test_Name").size().rename("Recent Volume")
+        prev_vol = prev_period.groupby("Test_Name").size().rename("Prev Volume")
+        growth = pd.concat([recent_vol, prev_vol], axis=1).fillna(0)
+        growth["Abs Growth"] = growth["Recent Volume"] - growth["Prev Volume"]
+        growth["% Growth"] = np.where(
+            growth["Prev Volume"] == 0,
+            np.nan,
+            100 * growth["Abs Growth"] / growth["Prev Volume"]
+        )
+        growth = growth.reset_index()
+        growth = growth.sort_values("Abs Growth", ascending=False).head(10)
+
+        fig_growth = px.bar(
+            growth, x="Test_Name", y="Abs Growth", text="Abs Growth",
+            color="Test_Name", color_discrete_sequence=px.colors.qualitative.Bold,
+            hover_data={"% Growth": ":.2f"},
+            title="Top 10 Fastest Growing Tests by Volume"
+        )
+        fig_growth.update_traces(textposition="outside")
+        fig_growth.update_layout(yaxis_title="Absolute Growth", xaxis_title="Test Name", showlegend=False)
+        st.plotly_chart(fig_growth, use_container_width=True, key="test_top10_growing")
+        st.dataframe(
+            growth[["Test_Name", "Recent Volume", "Prev Volume", "Abs Growth", "% Growth"]]
+            .rename(columns={"Abs Growth": "Absolute Growth", "% Growth": "Percent Growth (%)"})
+            .replace({np.nan: "N/A"})
+            .round(2),
+            use_container_width=True
+        )
+        generate_download_link(
+            growth[["Test_Name", "Recent Volume", "Prev Volume", "Abs Growth", "% Growth"]],
+            "top10_growing_tests_by_volume.csv"
+        )
+    else:
+        st.info("Not enough date data to calculate growth trends.")
+
+    # --- Analyst Breakdown (as is) --- #
+    st.markdown("#### 👩‍🔬 Analyst Breakdown")
+    if all(col in df.columns for col in ["Test_Name", "Analyst"]):
+        analyst_test = df.groupby("Analyst").agg(
+            Test_Count=("Test_Name", "count"),
+            Total_Revenue=("Price", "sum")
+        ).reset_index().sort_values("Test_Count", ascending=False)
+        fig_analyst = px.bar(
+            analyst_test, x="Analyst", y="Test_Count", text="Test_Count",
+            title="Total Test Volume by Analyst",
+            color="Analyst", color_discrete_sequence=px.colors.qualitative.Prism
+        )
+        fig_analyst.update_traces(textposition="outside")
+        fig_analyst.update_layout(xaxis_tickangle=-45, showlegend=False)
+        st.plotly_chart(fig_analyst, use_container_width=True, key="test_analyst_breakdown")
+        st.dataframe(analyst_test, use_container_width=True)
+        generate_download_link(analyst_test, "analyst_test_performance.csv")
+
+    st.markdown(
+        """
+        <style>
+        .stMetric {background-color: #f8fafc; border-radius: 10px; padding: 10px;}
+        .stPlotlyChart {background-color: #fff; border-radius: 10px; padding: 10px;}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+#Delay days and TAT
 with tabs[3]:
-    st.header("⏱ Delays and Turnaround Time")
+    st.markdown(
+        """
+        <div style="background-color:#f0f2f6;padding:1.2rem;border-radius:10px;margin-bottom:1.5rem;">
+        <span style="font-size:1.2rem; color:#4c78a8;">
+        <b>ℹ️ Delays & TAT:</b> All metrics and charts below reflect <b>current filters</b> and date range.
+        </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    st.markdown("## ⏱ Delays and Turnaround Time (TAT)")
 
-    from datetime import timedelta
+    # --- Prepare Data ---
+    df_delay = df.copy()
+    df_delay["Delay_Days"] = (df_delay["Completion_Date"] - df_delay["Estimated_Completion_Date"]).dt.days
+    df_delay["TAT_Days"] = (df_delay["Completion_Date"] - df_delay["Submission_Release_Date"]).dt.days
+    df_delay["Estimated_TAT_Days"] = (df_delay["Estimated_Completion_Date"] - df_delay["Submission_Release_Date"]).dt.days
+    df_delay["Delay_in_TAT_Days"] = df_delay["TAT_Days"] - df_delay["Estimated_TAT_Days"]
 
-    # --- Safe Adjusted Delay Calculator ---
-    def adjusted_calendar_delay(submit_date, est_date):
-        if pd.isna(submit_date) or pd.isna(est_date):
-            return pd.NaT
-        days = pd.date_range(start=submit_date + timedelta(days=1), end=est_date)
-        skipped = sum(1 for d in days if d.weekday() in [5, 6])  # Sat/Sun
-        return est_date - timedelta(days=skipped)
+    def completion_status(row):
+        if pd.isna(row["Completion_Date"]) or pd.isna(row["Estimated_Completion_Date"]):
+            return "Unknown"
+        elif row["Delay_Days"] < 0:
+            return "Early"
+        elif row["Delay_Days"] == 0:
+            return "On Time"
+        else:
+            return "Delayed"
+    df_delay["Completion_Status"] = df_delay.apply(completion_status, axis=1)
+    df_delay["Rush_Label"] = df_delay["Rush"].map({"Y": "Rush", "N": "Non-Rush"}).fillna("Unknown")
 
-    df_temp = df.copy()
+    status_order = ["Early", "On Time", "Delayed"]
+    color_map = {"Early": "#59a14f", "On Time": "#4c78a8", "Delayed": "#e45756"}
 
-    if all(col in df_temp.columns for col in ["Submission_Release_Date", "Estimated_Completion_Date", "Completion_Date"]):
-        df_temp = df_temp.dropna(subset=["Submission_Release_Date", "Estimated_Completion_Date", "Completion_Date"]).copy()
+    # --- KPIs ---
+    avg_actual_tat = df_delay["TAT_Days"].mean()
+    avg_estimated_tat = df_delay["Estimated_TAT_Days"].mean()
+    avg_early_days = df_delay.loc[df_delay["Completion_Status"] == "Early", "Delay_Days"].mean()
+    avg_delay_days = df_delay.loc[df_delay["Completion_Status"] == "Delayed", "Delay_Days"].mean()
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Avg Actual TAT (days)", f"{avg_actual_tat:.2f}" if not pd.isna(avg_actual_tat) else "N/A")
+    k2.metric("Avg Estimated TAT (days)", f"{avg_estimated_tat:.2f}" if not pd.isna(avg_estimated_tat) else "N/A")
+    k3.metric("Avg Early Days", f"{avg_early_days:.2f}" if not pd.isna(avg_early_days) else "N/A")
+    k4.metric("Avg Delay Days", f"{avg_delay_days:.2f}" if not pd.isna(avg_delay_days) else "N/A")
 
-        if delay_toggle == "Adjusted (skip Sat & Sun)":
-            df_temp["Adjusted_ETC"] = df_temp.apply(
-                lambda row: adjusted_calendar_delay(row["Submission_Release_Date"], row["Estimated_Completion_Date"]),
-                axis=1
+    st.markdown("---")
+
+    # --- Donut: Completion Status ---
+    st.markdown("### 🥯 Completion Status Overview")
+    status_counts = (
+        df_delay["Completion_Status"]
+        .value_counts()
+        .reindex(status_order + ["Unknown"], fill_value=0)
+        .rename_axis("Status")
+        .reset_index(name="Count")
+    )
+    fig_pie = px.pie(
+        status_counts, names="Status", values="Count", hole=0.4,
+        color="Status", color_discrete_map={**color_map, "Unknown": "#bab0ab"},
+        category_orders={"Status": status_order + ["Unknown"]},
+        title="Completion Status"
+    )
+    st.plotly_chart(fig_pie, use_container_width=True, key="status_pie")
+
+    # --- Bar: Distribution of Delay Days (with outlier handling) ---
+    st.markdown("### 📊 Distribution of Delay Days")
+    delay_dist = df_delay.groupby("Delay_Days").size().reset_index(name="Test_Count")
+    PLOT_MIN = -20
+    PLOT_MAX = 90
+    plot_delay_dist = delay_dist[(delay_dist["Delay_Days"] >= PLOT_MIN) & (delay_dist["Delay_Days"] <= PLOT_MAX)]
+    outliers_count = delay_dist[(delay_dist["Delay_Days"] < PLOT_MIN) | (delay_dist["Delay_Days"] > PLOT_MAX)]["Test_Count"].sum()
+
+    fig_delay_dist = px.bar(
+        plot_delay_dist,
+        x="Delay_Days",
+        y="Test_Count",
+        labels={
+            "Delay_Days": "Delay Days (Negative=Early, 0=On Time, Positive=Delayed)",
+            "Test_Count": "Number of Tests"
+        },
+        title="Number of Tests by Delay Days",
+        color_discrete_sequence=["#4c78a8"]
+    )
+    fig_delay_dist.update_layout(
+        xaxis=dict(dtick=1, range=[PLOT_MIN, PLOT_MAX]),
+        bargap=0.1
+    )
+    st.plotly_chart(fig_delay_dist, use_container_width=True, key="delay_days_dist")
+
+    if outliers_count > 0:
+        st.info(f"{outliers_count} tests had delay days outside the -20 to +90 range and are not shown in this chart.")
+
+    st.markdown("---")
+
+    # --- Rush/Non-Rush Distribution (toggle for Volume/Avg Delay Days) ---
+    st.markdown("## ⚡ Rush vs Non-Rush Completion Status Distribution")
+    toggle_metric = st.toggle("Show charts by Avg Delay Days (toggle off for Volume)", value=False)
+    metric_label = "Delay_Days" if toggle_metric else "Count"
+    metric_title = "Avg Delay Days" if toggle_metric else "Volume"
+
+    if toggle_metric:
+        rush_status = (
+            df_delay.groupby(["Rush_Label", "Completion_Status"])["Delay_Days"].mean()
+            .unstack().reindex(columns=status_order, fill_value=0)
+            .reset_index()
+        )
+        fig_rush = px.bar(
+            rush_status, x="Rush_Label", y=status_order,
+            barmode="group",
+            color_discrete_map=color_map,
+            labels={"value": "Avg Delay Days"},
+            title="Rush vs Non-Rush: Avg Delay Days by Status"
+        )
+    else:
+        rush_status = (
+            df_delay.groupby(["Rush_Label", "Completion_Status"]).size()
+            .unstack(fill_value=0).reindex(columns=status_order, fill_value=0)
+            .reset_index()
+        )
+        fig_rush = px.bar(
+            rush_status, x="Rush_Label", y=status_order,
+            barmode="group",
+            color_discrete_map=color_map,
+            labels={"value": "Test Count"},
+            title="Rush vs Non-Rush: Volume by Status"
+        )
+    st.plotly_chart(fig_rush, use_container_width=True, key="rush_status_dist")
+
+    st.markdown("---")
+
+    # --- Top 10 Tests by (toggle) for Early, On Time, Delayed ---
+    st.markdown(f"## 🏆 Top 10 Tests by {metric_title} (by Status)")
+    for status in status_order:
+        st.markdown(f"#### Top 10 {status} Tests by {metric_title}")
+        if toggle_metric:
+            top_tests = (
+                df_delay[df_delay["Completion_Status"] == status]
+                .groupby("Test_Name")["Delay_Days"].mean()
+                .nlargest(10).reset_index()
+                .rename(columns={"Delay_Days": metric_label})
             )
         else:
-            df_temp["Adjusted_ETC"] = df_temp["Estimated_Completion_Date"]
+            top_tests = (
+                df_delay[df_delay["Completion_Status"] == status]
+                .groupby("Test_Name").size()
+                .nlargest(10).reset_index(name=metric_label)
+            )
+        fig = px.bar(
+            top_tests, x="Test_Name", y=metric_label, text=metric_label,
+            color="Test_Name", color_discrete_sequence=px.colors.qualitative.Pastel,
+            title=f"Top 10 {status} Tests by {metric_title}"
+        )
+        if toggle_metric:
+            fig.update_traces(texttemplate="%{y:.1f} days")
+        st.plotly_chart(fig, use_container_width=True, key=f"top10_tests_{metric_label}_{status}")
 
-        df_temp["Delay_Days"] = (df_temp["Completion_Date"] - df_temp["Adjusted_ETC"]).dt.days
-        df_temp["Delay_Method"] = delay_toggle
+    st.markdown("---")
 
-    # --- Completed Tests with Delay ---
-    if all(col in df_temp.columns for col in ["Status", "Delay_Days"]):
-        completed_df = df_temp[df_temp["Status"] == "Completed"].copy()
-        completed_df = completed_df[completed_df["Delay_Days"].notna()]
-        completed_df = completed_df[
-            (completed_df["Delay_Days"] > -30) &
-            (completed_df["Delay_Days"] < 60)
-        ]
-
-        if completed_df.empty:
-            st.warning("⚠️ No completed tests match the selected filters or date range.")
-        else:
-            # --- Delay Distribution ---
-            st.subheader(f"Distribution of Completion Delays ({delay_toggle})")
-            fig10 = px.histogram(completed_df, x="Delay_Days", nbins=40, title="Delay Distribution (Days)")
-            fig10.update_traces(marker_color="#4c78a8", marker_line_color="black", marker_line_width=0.5)
-            fig10.update_layout(xaxis_title="Delay (Days)", yaxis_title="Test Count")
-            st.plotly_chart(fig10, use_container_width=True, key="fig10_delay_dist")
-
-            # --- On-Time vs Delayed ---
-            st.subheader("On-Time vs Delayed Completion")
-            completed_df["Status_Eval"] = np.where(completed_df["Delay_Days"] > 0, "Delayed", "On-Time")
-            status_count = completed_df["Status_Eval"].value_counts().reset_index(name="Count").rename(columns={"index": "Status_Eval"})
-            fig11 = px.pie(status_count, names="Status_Eval", values="Count", hole=0.4, title="Proportion of On-Time vs Delayed Tests")
-            st.plotly_chart(fig11, use_container_width=True, key="fig11_ontime_pie")
-
-            # --- Rush vs Non-Rush ---
-            st.subheader("Rush vs Non-Rush Turnaround Comparison")
-            if "Rush" in completed_df.columns:
-                rush_df = completed_df[completed_df["Rush"].isin(["Y", "N"])]
-                rush_delay = rush_df.groupby("Rush")["Delay_Days"].agg(["mean", "count"]).reset_index().round(2)
-                fig12 = px.bar(rush_delay, x="Rush", y="mean", text="mean", title="Avg Delay by Rush Category")
-                fig12.update_traces(marker_color=["#59a14f", "#f28e2b"], textposition="outside")
-                fig12.update_layout(xaxis_title="Rush Category", yaxis_title="Average Delay (Days)")
-                st.plotly_chart(fig12, use_container_width=True, key="fig12_rush")
-                generate_download_link(rush_delay, "rush_vs_nonrush_delay.csv")
-
-            # --- Avg Delay by Client ---
-            st.subheader("Avg Delay by Client Facility")
-            if "Client_Facility" in completed_df.columns:
-                delay_client = (
-                    completed_df.groupby("Client_Facility")["Delay_Days"]
-                    .mean()
-                    .dropna()
-                    .reset_index()
-                    .sort_values("Delay_Days", ascending=False)
-                    .head(20)
-                )
-                fig14 = px.bar(
-                    delay_client,
-                    x="Client_Facility",
-                    y="Delay_Days",
-                    text="Delay_Days",
-                    title="Top 20 Clients by Avg Delay"
-                )
-                fig14.update_layout(
-                    xaxis_title="Client Facility",
-                    yaxis_title="Avg Delay (Days)",
-                    bargap=0.3,
-                    xaxis_tickangle=-45
-                )
-                st.plotly_chart(fig14, use_container_width=True, key="fig14_delay_client")
-
-            # --- Delay Data Preview ---
-            st.subheader("Delay Data Preview")
-            preview_cols = ["Submission_Release_Date", "Test_Name", "Client_Facility", "Analyst", "Delay_Days", "Rush", "Delay_Method"]
-            preview_cols = [col for col in preview_cols if col in completed_df.columns]
-            st.dataframe(completed_df[preview_cols].head(100))
-
-            # --- Download Buttons ---
-            generate_download_link(completed_df, "completed_tests_delay_data.csv")
-            generate_download_link(status_count, "ontime_vs_delayed.csv")
-
+    # --- Top 10 Delayed Clients: Toggle for Volume/Avg Delay Days, only Delayed ---
+    st.markdown("## 🏢 Top 10 Delayed Clients")
+    if toggle_metric:
+        top_clients = (
+            df_delay[df_delay["Completion_Status"] == "Delayed"]
+            .groupby("Client_Facility")["Delay_Days"].mean()
+            .nlargest(10).reset_index()
+            .rename(columns={"Delay_Days": metric_label})
+        )
     else:
-        st.warning("Delay and completion status columns not found in data.")
+        top_clients = (
+            df_delay[df_delay["Completion_Status"] == "Delayed"]
+            .groupby("Client_Facility").size()
+            .nlargest(10).reset_index(name=metric_label)
+        )
+    fig = px.bar(
+        top_clients, x="Client_Facility", y=metric_label, text=metric_label,
+        color="Client_Facility", color_discrete_sequence=px.colors.qualitative.Prism,
+        title=f"Top 10 Delayed Clients by {metric_title}"
+    )
+    if toggle_metric:
+        fig.update_traces(texttemplate="%{y:.1f} days")
+    st.plotly_chart(fig, use_container_width=True, key=f"top10_clients_{metric_label}_delayed")
+
+    st.markdown("---")
+    st.markdown("#### Download Raw Delay Data")
+    generate_download_link(df_delay, "full_delay_data.csv")
 
 
-# === Forecasting === #
+
+
+#Forecasting
+
 with tabs[4]:
     st.header("Forecasting with Prophet (Selected Tests Only)")
 
+    # Forecasting controls
     confidence_level = st.slider("Confidence Level (%)", 50, 99, 95, key="conf_slider")
     forecast_periods = st.slider("Periods to Predict", 4, 20, 8, key="period_slider")
     forecast_freq = st.radio("Forecast Granularity", ["Daily", "Monthly"], horizontal=True, key="freq_radio")
@@ -525,11 +862,11 @@ with tabs[4]:
         st.info("Please select one or more tests from the sidebar to view forecast.")
         st.stop()
 
-    selected_tests = test_filter
-    base = df[(df["Status"] == "Completed") & df["Submission_Release_Date"].notna()].copy()
-    base["ds"] = pd.to_datetime(base["Submission_Release_Date"], errors="coerce")
+    # Use only completed tests and their actual completion dates for actuals
+    base = df[(df["Status"] == "Completed") & df["Completion_Date"].notna()].copy()
+    base["ds"] = pd.to_datetime(base["Completion_Date"], errors="coerce")
 
-    for test in selected_tests:
+    for test in test_filter:
         st.subheader(f"Forecast for: {test}")
         test_df = base[base["Test_Name"] == test].copy().dropna(subset=["ds", "Price"])
 
@@ -537,126 +874,111 @@ with tabs[4]:
             st.warning(f"Not enough valid data to forecast '{test}'")
             continue
 
-        try:
-            # --- Aggregation ---
-            agg_df = test_df.groupby(pd.Grouper(key="ds", freq=freq)).agg(
-                y=("Test_Name", "count"),
-                price_avg=("Price", "mean")
-            ).reset_index()
-            agg_df = agg_df[agg_df["y"] > 0]  # remove gaps
+        # Aggregate by selected frequency
+        agg_df = test_df.groupby(pd.Grouper(key="ds", freq=freq)).agg(
+            y=("Test_Name", "count"),
+            price_avg=("Price", "mean")
+        ).reset_index()
+        agg_df = agg_df[agg_df["y"] > 0]
 
-            # --- Prophet ---
-            m = Prophet(interval_width=confidence_level / 100)
-            m.fit(agg_df[["ds", "y"]])
-            future = m.make_future_dataframe(periods=forecast_periods, freq=freq)
-            forecast = m.predict(future).merge(agg_df, on="ds", how="left")
+        # Prophet model
+        m = Prophet(interval_width=confidence_level / 100)
+        m.fit(agg_df[["ds", "y"]])
+        future = m.make_future_dataframe(periods=forecast_periods, freq=freq)
+        forecast = m.predict(future).merge(agg_df, on="ds", how="left")
 
-            # --- Fill missing pricing ---
-            forecast["price_avg"] = forecast["price_avg"].ffill().replace(0, np.nan).bfill()
-            forecast["Predicted Volume"] = forecast["yhat"].clip(lower=0)
-            forecast["Actual Volume"] = forecast["y"]
-            forecast["Predicted Revenue"] = forecast["Predicted Volume"] * forecast["price_avg"]
-            forecast["Actual Revenue"] = forecast["Actual Volume"] * forecast["price_avg"]
-            forecast["Predicted Revenue Upper"] = forecast["yhat_upper"] * forecast["price_avg"]
-            forecast["Predicted Revenue Lower"] = forecast["yhat_lower"] * forecast["price_avg"]
+        # Fill missing pricing
+        forecast["price_avg"] = forecast["price_avg"].ffill().replace(0, np.nan).bfill()
+        forecast["Predicted Volume"] = forecast["yhat"].clip(lower=0)
+        forecast["Actual Volume"] = forecast["y"]
+        forecast["Predicted Revenue"] = forecast["Predicted Volume"] * forecast["price_avg"]
+        forecast["Actual Revenue"] = forecast["Actual Volume"] * forecast["price_avg"]
+        forecast["Predicted Revenue Upper"] = forecast["yhat_upper"] * forecast["price_avg"]
+        forecast["Predicted Revenue Lower"] = forecast["yhat_lower"] * forecast["price_avg"]
 
-            # --- Metrics ---
-            def add_stats(title, y_true, y_pred, model=None):
-                r2 = np.corrcoef(y_true, y_pred)[0, 1]**2 if len(y_true) > 1 else 0
-                mae = np.mean(np.abs(y_true - y_pred))
-                rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-                mase = mae / np.mean(np.abs(y_true - y_true.shift(1)).dropna()) if len(y_true) > 1 else 0
-                smape = np.mean(2 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + 1e-9))
-                alpha = round(model.params["m"].mean(), 4) if model else np.nan
-                beta = round(model.params["k"].mean(), 4) if model else np.nan
-                gamma = round(np.std(model.params.get("delta", [0])), 4) if model else np.nan
+        # Linear regression for trend
+        X = np.arange(len(forecast)).reshape(-1, 1)
+        eval_df = forecast.dropna(subset=["Actual Volume"])
+        lr = LinearRegression().fit(X[:len(eval_df)], eval_df["Actual Volume"])
+        forecast["Vol_Linear"] = lr.predict(X)
+        y_log = np.log1p(eval_df["Actual Volume"])
+        exp_model = LinearRegression().fit(X[:len(y_log)], y_log)
+        forecast["Vol_Exp"] = np.expm1(exp_model.predict(X))
 
-                st.markdown(f"### {title} Metrics")
-                st.dataframe(pd.DataFrame({
-                    "Metric": ["R²", "MAE", "RMSE", "MASE", "SMAPE", "Alpha", "Beta", "Gamma"],
-                    "Value": [r2, mae, rmse, mase, smape, alpha, beta, gamma]
-                }).round(3), use_container_width=True)
+        # --- Volume Forecast Plot ---
+        fig_vol = go.Figure([
+            go.Scatter(x=forecast["ds"], y=forecast["yhat_upper"], line=dict(width=0), showlegend=False),
+            go.Scatter(x=forecast["ds"], y=forecast["yhat_lower"], fill="tonexty", fillcolor="rgba(76, 120, 168, 0.2)", line=dict(width=0), name="Confidence Band"),
+            go.Scatter(x=forecast["ds"], y=forecast["Actual Volume"], mode="lines+markers", name="Actual", line=dict(color="white")),
+            go.Scatter(x=forecast["ds"], y=forecast["Predicted Volume"], mode="lines", name="Forecast", line=dict(color="lightblue")),
+            go.Scatter(x=forecast["ds"], y=forecast["Vol_Linear"], mode="lines", name="Linear Trend", line=dict(color="orange", dash="dot")),
+            go.Scatter(x=forecast["ds"], y=forecast["Vol_Exp"], mode="lines", name="Exponential Trend", line=dict(color="teal", dash="dash"))
+        ])
+        fig_vol.update_layout(title=f"{test} - Test Volume Forecast", xaxis_title="Date", yaxis_title="Volume")
+        st.plotly_chart(fig_vol, use_container_width=True, key=f"forecast_vol_{test}")
 
-            # --- Volume Forecast ---
-            st.markdown("## Volume Forecast")
-            eval_df = forecast.dropna(subset=["Actual Volume"])
-            X = np.arange(len(forecast)).reshape(-1, 1)
-            add_stats("Volume Forecast", eval_df["Actual Volume"], eval_df["Predicted Volume"], m)
+        # --- Volume Summary Table ---
+        forecast["Month"] = forecast["ds"].dt.to_period("M")
+        forecast["Quarter"] = forecast["ds"].dt.to_period("Q")
+        future_only = forecast[forecast["ds"] > test_df["ds"].max()]
+        daily_avg = pd.DataFrame([{
+            "Group_Type": f"{forecast_freq} (avg)",
+            "Group": f"{future_only['ds'].min().date()} to {future_only['ds'].max().date()}",
+            "Predicted Volume": round(future_only["Predicted Volume"].mean(), 2),
+            "Actual Volume": np.nan
+        }]) if not future_only.empty else pd.DataFrame()
 
-            lr = LinearRegression().fit(X[:len(eval_df)], eval_df["Actual Volume"])
-            forecast["Vol_Linear"] = lr.predict(X)
-            y_log = np.log1p(eval_df["Actual Volume"])
-            exp_model = LinearRegression().fit(X[:len(y_log)], y_log)
-            forecast["Vol_Exp"] = np.expm1(exp_model.predict(X))
+        month_summary = forecast.groupby("Month").agg({"Predicted Volume": "sum", "Actual Volume": "sum"}).reset_index().rename(columns={"Month": "Group"}).assign(Group_Type="Month")
+        quarter_summary = forecast.groupby("Quarter").agg({"Predicted Volume": "sum", "Actual Volume": "sum"}).reset_index().rename(columns={"Quarter": "Group"}).assign(Group_Type="Quarter")
 
-            fig_vol = go.Figure([
-                go.Scatter(x=forecast["ds"], y=forecast["yhat_upper"], line=dict(width=0), showlegend=False),
-                go.Scatter(x=forecast["ds"], y=forecast["yhat_lower"], fill="tonexty", fillcolor="rgba(76, 120, 168, 0.2)", line=dict(width=0), name="Confidence Band"),
-                go.Scatter(x=forecast["ds"], y=forecast["Actual Volume"], mode="lines+markers", name="Actual", line=dict(color="white")),
-                go.Scatter(x=forecast["ds"], y=forecast["Predicted Volume"], mode="lines", name="Forecast", line=dict(color="lightblue")),
-                go.Scatter(x=forecast["ds"], y=forecast["Vol_Linear"], mode="lines", name="Linear Trend", line=dict(color="orange", dash="dot")),
-                go.Scatter(x=forecast["ds"], y=forecast["Vol_Exp"], mode="lines", name="Exponential Trend", line=dict(color="teal", dash="dash"))
-            ])
-            fig_vol.update_layout(title=f"{test} - Test Volume Forecast", xaxis_title="Date", yaxis_title="Volume")
-            st.plotly_chart(fig_vol, use_container_width=True)
+        st.subheader("Volume Forecast Summary")
+        st.dataframe(pd.concat([daily_avg, month_summary, quarter_summary], ignore_index=True), use_container_width=True)
 
-            # --- Volume Summary ---
-            forecast["Month"] = forecast["ds"].dt.to_period("M")
-            forecast["Quarter"] = forecast["ds"].dt.to_period("Q")
-            future_only = forecast[forecast["ds"] > test_df["ds"].max()]
-            daily_avg = pd.DataFrame([{
-                "Group_Type": f"{forecast_freq} (avg)",
-                "Group": f"{future_only['ds'].min().date()} to {future_only['ds'].max().date()}",
-                "Predicted Volume": round(future_only["Predicted Volume"].mean(), 2),
-                "Actual Volume": np.nan
-            }]) if not future_only.empty else pd.DataFrame()
+        # --- Revenue Forecast ---
+        lr_r = LinearRegression().fit(X[:len(eval_df)], eval_df["Actual Revenue"])
+        forecast["Rev_Linear"] = lr_r.predict(X)
+        y_log_r = np.log1p(eval_df["Actual Revenue"])
+        exp_model_r = LinearRegression().fit(X[:len(y_log_r)], y_log_r)
+        forecast["Rev_Exp"] = np.expm1(exp_model_r.predict(X))
 
-            month_summary = forecast.groupby("Month").agg({"Predicted Volume": "sum", "Actual Volume": "sum"}).reset_index().rename(columns={"Month": "Group"}).assign(Group_Type="Month")
-            quarter_summary = forecast.groupby("Quarter").agg({"Predicted Volume": "sum", "Actual Volume": "sum"}).reset_index().rename(columns={"Quarter": "Group"}).assign(Group_Type="Quarter")
+        fig_rev = go.Figure([
+            go.Scatter(x=forecast["ds"], y=forecast["Predicted Revenue Upper"], line=dict(width=0), showlegend=False),
+            go.Scatter(x=forecast["ds"], y=forecast["Predicted Revenue Lower"], fill="tonexty", fillcolor="rgba(89, 161, 79, 0.2)", line=dict(width=0), name="Confidence Band"),
+            go.Scatter(x=forecast["ds"], y=forecast["Actual Revenue"], mode="lines+markers", name="Actual", line=dict(color="white")),
+            go.Scatter(x=forecast["ds"], y=forecast["Predicted Revenue"], mode="lines", name="Forecast", line=dict(color="green")),
+            go.Scatter(x=forecast["ds"], y=forecast["Rev_Linear"], mode="lines", name="Linear Trend", line=dict(color="purple", dash="dot")),
+            go.Scatter(x=forecast["ds"], y=forecast["Rev_Exp"], mode="lines", name="Exponential Trend", line=dict(color="gold", dash="dash"))
+        ])
+        fig_rev.update_layout(title=f"{test} - Revenue Forecast", xaxis_title="Date", yaxis_title="Revenue")
+        st.plotly_chart(fig_rev, use_container_width=True, key=f"forecast_rev_{test}")
 
-            st.subheader("Volume Forecast Summary")
-            st.dataframe(pd.concat([daily_avg, month_summary, quarter_summary], ignore_index=True), use_container_width=True)
+        # --- Revenue Summary Table ---
+        daily_avg_r = pd.DataFrame([{
+            "Group_Type": f"{forecast_freq} (avg)",
+            "Group": f"{future_only['ds'].min().date()} to {future_only['ds'].max().date()}",
+            "Predicted Revenue": round(future_only["Predicted Revenue"].mean(), 2),
+            "Actual Revenue": np.nan
+        }]) if not future_only.empty else pd.DataFrame()
 
-            # --- Revenue Forecast ---
-            st.markdown("## Revenue Forecast")
-            eval_df_r = forecast.dropna(subset=["Actual Revenue"])
-            add_stats("Revenue Forecast", eval_df_r["Actual Revenue"], eval_df_r["Predicted Revenue"], m)
+        month_summary_r = forecast.groupby("Month").agg({"Predicted Revenue": "sum", "Actual Revenue": "sum"}).reset_index().rename(columns={"Month": "Group"}).assign(Group_Type="Month")
+        quarter_summary_r = forecast.groupby("Quarter").agg({"Predicted Revenue": "sum", "Actual Revenue": "sum"}).reset_index().rename(columns={"Quarter": "Group"}).assign(Group_Type="Quarter")
 
-            lr_r = LinearRegression().fit(X[:len(eval_df_r)], eval_df_r["Actual Revenue"])
-            forecast["Rev_Linear"] = lr_r.predict(X)
-            y_log_r = np.log1p(eval_df_r["Actual Revenue"])
-            exp_model_r = LinearRegression().fit(X[:len(y_log_r)], y_log_r)
-            forecast["Rev_Exp"] = np.expm1(exp_model_r.predict(X))
+        st.subheader("Revenue Forecast Summary")
+        st.dataframe(pd.concat([daily_avg_r, month_summary_r, quarter_summary_r], ignore_index=True), use_container_width=True)
 
-            fig_rev = go.Figure([
-                go.Scatter(x=forecast["ds"], y=forecast["Predicted Revenue Upper"], line=dict(width=0), showlegend=False),
-                go.Scatter(x=forecast["ds"], y=forecast["Predicted Revenue Lower"], fill="tonexty", fillcolor="rgba(89, 161, 79, 0.2)", line=dict(width=0), name="Confidence Band"),
-                go.Scatter(x=forecast["ds"], y=forecast["Actual Revenue"], mode="lines+markers", name="Actual", line=dict(color="white")),
-                go.Scatter(x=forecast["ds"], y=forecast["Predicted Revenue"], mode="lines", name="Forecast", line=dict(color="green")),
-                go.Scatter(x=forecast["ds"], y=forecast["Rev_Linear"], mode="lines", name="Linear Trend", line=dict(color="purple", dash="dot")),
-                go.Scatter(x=forecast["ds"], y=forecast["Rev_Exp"], mode="lines", name="Exponential Trend", line=dict(color="gold", dash="dash"))
-            ])
-            fig_rev.update_layout(title=f"{test} - Revenue Forecast", xaxis_title="Date", yaxis_title="Revenue")
-            st.plotly_chart(fig_rev, use_container_width=True)
-
-            daily_avg_r = pd.DataFrame([{
-                "Group_Type": f"{forecast_freq} (avg)",
-                "Group": f"{future_only['ds'].min().date()} to {future_only['ds'].max().date()}",
-                "Predicted Revenue": round(future_only["Predicted Revenue"].mean(), 2),
-                "Actual Revenue": np.nan
-            }]) if not future_only.empty else pd.DataFrame()
-
-            month_summary_r = forecast.groupby("Month").agg({"Predicted Revenue": "sum", "Actual Revenue": "sum"}).reset_index().rename(columns={"Month": "Group"}).assign(Group_Type="Month")
-            quarter_summary_r = forecast.groupby("Quarter").agg({"Predicted Revenue": "sum", "Actual Revenue": "sum"}).reset_index().rename(columns={"Quarter": "Group"}).assign(Group_Type="Quarter")
-
-            st.subheader("Revenue Forecast Summary")
-            st.dataframe(pd.concat([daily_avg_r, month_summary_r, quarter_summary_r], ignore_index=True), use_container_width=True)
-
-        except Exception as e:
-            st.error(f"❌ Forecasting failed for {test}: {e}")
 
 # === Statistical Insights === #
 with tabs[5]:
+    st.markdown(
+        """
+        <div style="background-color:#f0f2f6;padding:1.2rem;border-radius:10px;margin-bottom:1.5rem;">
+        <span style="font-size:1.2rem; color:#4c78a8;">
+        <b>ℹ️ Statistical Insights by Test:</b> All tables below reflect <b>current filters</b> and date range.
+        </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
     st.header("Statistical Insights by Test")
 
     # Apply filters
@@ -726,3 +1048,40 @@ with tabs[5]:
         generate_download_link(facility_summary, "facility_summary.csv")
     else:
         st.warning("Missing columns: 'Facility_Type' or 'Price'")
+
+    # 5. Correlation: Test Volume vs. Average Delay
+    st.subheader("Correlation: Test Volume vs. Average Delay")
+    if all(col in filtered_df.columns for col in ["Test_Name", "Delay_Days"]):
+        delay_volume = filtered_df.groupby("Test_Name").agg(
+            Volume=("Test_Name", "count"),
+            Avg_Delay=("Delay_Days", "mean")
+        ).reset_index()
+        delay_volume = delay_volume.dropna(subset=["Avg_Delay"])
+        st.dataframe(delay_volume.sort_values("Avg_Delay", ascending=False), use_container_width=True)
+        generate_download_link(delay_volume, "test_volume_vs_avg_delay.csv")
+
+        # Calculate and display correlation
+        if not delay_volume.empty and delay_volume["Volume"].nunique() > 1 and delay_volume["Avg_Delay"].nunique() > 1:
+            corr = delay_volume["Volume"].corr(delay_volume["Avg_Delay"])
+            st.info(f"Correlation coefficient between test volume and average delay: **{corr:.2f}**")
+            fig_corr = px.scatter(
+                delay_volume, x="Volume", y="Avg_Delay", text="Test_Name",
+                trendline="ols", title="Test Volume vs. Average Delay"
+            )
+            st.plotly_chart(fig_corr, use_container_width=True, key="statinsights_vol_delay_scatter")
+        else:
+            st.info("Not enough data for correlation analysis.")
+    else:
+        st.warning("Missing columns: 'Test_Name' or 'Delay_Days'")
+
+    st.markdown(
+        """
+        <style>
+        .stDataFrame {background-color: #fff; border-radius: 10px; padding: 10px;}
+        .stPlotlyChart {background-color: #fff; border-radius: 10px; padding: 10px;}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    
