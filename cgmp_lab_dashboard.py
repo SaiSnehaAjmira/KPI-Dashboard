@@ -19,13 +19,6 @@ def adjusted_calendar_delay(submit_date, est_date, skip_sundays=True):
     else:
         return est_date
 
-# ========== Cached File Reader ==========
-@st.cache_data(show_spinner=False)
-def load_file(file):
-    if file.name.endswith("xlsx"):
-        return pd.read_excel(file, engine="openpyxl")
-    return pd.read_csv(file)
-
 # ========== CSV Download Button ==========
 def generate_download_link(df, filename):
     csv = df.to_csv(index=False)
@@ -52,20 +45,31 @@ if not uploaded_files:
     st.info("Please upload one or more lab files to begin.")
     st.stop()
 
-# ========== Load + Merge Files ==========
-df_list = []
-for file in uploaded_files:
-    temp_df = load_file(file)
-    # Parse dates and numerics
-    for col in ["Submission_Release_Date", "Completion_Date", "Estimated_Completion_Date"]:
-        if col in temp_df.columns:
-            temp_df[col] = pd.to_datetime(temp_df[col], errors="coerce")
-    if "Price" in temp_df.columns:
-        temp_df["Price"] = pd.to_numeric(temp_df["Price"], errors="coerce")
-    df_list.append(temp_df)
+# ========== Load + Merge Files (CACHED) ==========
+@st.cache_data(show_spinner=True)
+def load_and_merge(files):
+    df_list = []
+    for file in files:
+        if file.name.endswith("xlsx"):
+            temp_df = pd.read_excel(file, engine="openpyxl")
+        else:
+            temp_df = pd.read_csv(file)
+        for col in ["Submission_Release_Date", "Completion_Date", "Estimated_Completion_Date"]:
+            if col in temp_df.columns:
+                temp_df[col] = pd.to_datetime(temp_df[col], errors="coerce")
+        if "Price" in temp_df.columns:
+            temp_df["Price"] = pd.to_numeric(temp_df["Price"], errors="coerce")
+        df_list.append(temp_df)
+    df = pd.concat(df_list, ignore_index=True)
+    return df
 
-df = pd.concat(df_list, ignore_index=True)
+df = load_and_merge(uploaded_files)
 df_raw = df.copy()
+
+# ========== Standardize Analyst Names (lowercase, strip spaces) ==========
+for d in [df, df_raw]:
+    if "Analyst" in d.columns:
+        d["Analyst"] = d["Analyst"].astype(str).str.strip().str.lower()
 
 # ========== Separate Canceled Data BEFORE Filtering ==========
 canceled_df = df[df["Status"] == "Canceled"].copy()
@@ -85,13 +89,16 @@ def safe_multiselect(label, col):
 
 test_filter = safe_multiselect("Test Name", "Test_Name")
 client_filter = safe_multiselect("Client Facility", "Client_Facility")
-analyst_filter = safe_multiselect("Analyst", "Analyst")
+analyst_filter = safe_multiselect("Analyst", "Analyst")  # Now only shows unique, lowercase names
 facility_type_filter = safe_multiselect("Facility Type", "Facility_Type")
 rush_filter = safe_multiselect("Rush", "Rush")
 control_filter = safe_multiselect("Controlled Substance Class", "Controlled_Substance_Class")
 hazardous_filter = safe_multiselect("Hazardous Drug", "Hazardous_Drug")
 status_filter = safe_multiselect("Test Status", "Status")
 sample_search = st.sidebar.text_input("Search Sample Name")
+
+# ... (rest of your filter, date, and dashboard logic remains unchanged)
+
 
 # ========== Delay Toggle ==========
 delay_toggle = st.sidebar.radio(
@@ -136,6 +143,19 @@ for col, selected in filter_conditions:
 if sample_search:
     df = df[df["Sample_Name"].astype(str).str.contains(sample_search, case=False, na=False)]
 
+# ========== Filter canceled data based on current filters ==========
+filtered_canceled_df = df_raw[df_raw["Status"] == "Canceled"]
+# Apply the same filters to canceled data
+filtered_canceled_df = filtered_canceled_df[
+    (filtered_canceled_df["Submission_Release_Date"] >= pd.to_datetime(start_date)) &
+    (filtered_canceled_df["Submission_Release_Date"] <= pd.to_datetime(end_date))
+]
+for col, selected in filter_conditions:
+    if selected:
+        filtered_canceled_df = filtered_canceled_df[filtered_canceled_df[col].isin(selected)]
+if sample_search:
+    filtered_canceled_df = filtered_canceled_df[filtered_canceled_df["Sample_Name"].astype(str).str.contains(sample_search, case=False, na=False)]
+
 # ========== Compute Delay (Consistent Everywhere) ==========
 completed_mask = df["Status"] == "Completed"
 df.loc[completed_mask, "Adj_Est_Completion"] = df.loc[completed_mask].apply(
@@ -156,6 +176,7 @@ tabs = st.tabs([
     "Forecasting", 
     "Statistical Insights"
 ])
+
 
 #Executive Tab
 
@@ -592,7 +613,6 @@ with tabs[2]:
 
         recent_period = df[df["Submission_Release_Date"] > cutoff_recent]
         prev_period = df[(df["Submission_Release_Date"] > cutoff_prev) & (df["Submission_Release_Date"] <= cutoff_recent)]
-
         recent_vol = recent_period.groupby("Test_Name").size().rename("Recent Volume")
         prev_vol = prev_period.groupby("Test_Name").size().rename("Prev Volume")
         growth = pd.concat([recent_vol, prev_vol], axis=1).fillna(0)
@@ -628,7 +648,7 @@ with tabs[2]:
     else:
         st.info("Not enough date data to calculate growth trends.")
 
-    # --- Analyst Breakdown (as is) --- #
+    # --- Analyst Breakdown --- #
     st.markdown("#### 👩‍🔬 Analyst Breakdown")
     if all(col in df.columns for col in ["Test_Name", "Analyst"]):
         analyst_test = df.groupby("Analyst").agg(
@@ -655,6 +675,81 @@ with tabs[2]:
         """,
         unsafe_allow_html=True
     )
+
+    # --- Month-over-Month Analyst Completed Test Count (by Completion Date) ---
+    st.markdown("#### 📈 Month-over-Month Analyst Completed Test Count (by Completion Date)")
+
+    # 1. Filter for completed tests within the selected completion date range
+    completed_df = df_raw[
+        (df_raw["Status"] == "Completed") &
+        (df_raw["Completion_Date"].notna()) &
+        (df_raw["Completion_Date"] >= pd.to_datetime(start_date)) &
+        (df_raw["Completion_Date"] <= pd.to_datetime(end_date))
+    ].copy()
+    completed_df["Month"] = completed_df["Completion_Date"].dt.to_period("M").dt.to_timestamp()
+
+    # 2. Further filter by analyst if analyst_filter is used
+    if analyst_filter:
+        completed_df = completed_df[completed_df["Analyst"].isin(analyst_filter)]
+
+    # 3. Group by month and analyst
+    monthly_analyst_completed = (
+        completed_df.groupby(['Month', 'Analyst'])
+        .size()
+        .reset_index(name='Completed_Count')
+    )
+
+    # 4. Get all relevant analysts for the legend
+    if analyst_filter:
+        analysts_to_show = analyst_filter
+    else:
+        analysts_to_show = monthly_analyst_completed["Analyst"].unique()
+
+    # 5. Ensure all months are present for each analyst (fill missing with 0)
+    if not monthly_analyst_completed.empty:
+        all_months = pd.date_range(
+            start=monthly_analyst_completed['Month'].min(),
+            end=monthly_analyst_completed['Month'].max(),
+            freq='MS'
+        )
+        full_index = pd.MultiIndex.from_product([all_months, analysts_to_show], names=['Month', 'Analyst'])
+        monthly_analyst_completed = (
+            monthly_analyst_completed
+            .set_index(['Month', 'Analyst'])
+            .reindex(full_index, fill_value=0)
+            .reset_index()
+        )
+
+    # 6. Plot
+    fig_line = px.line(
+        monthly_analyst_completed,
+        x="Month",
+        y="Completed_Count",
+        color="Analyst",
+        markers=True,
+        title="Month-over-Month Completed Test Count by Analyst",
+        labels={"Completed_Count": "Completed Test Count", "Month": "Month"}
+    )
+    fig_line.update_xaxes(
+        dtick="M1",
+        tickformat="%b %Y",
+        ticklabelmode="period",
+        tickangle=-45,
+        type='category'
+    )
+    fig_line.update_layout(
+        xaxis_title="Month",
+        yaxis_title="Completed Test Count",
+        legend_title_text="Analyst",
+        hovermode="x unified"
+    )
+
+    st.plotly_chart(fig_line, use_container_width=True, key="mo_monthly_analyst_completed")
+    st.dataframe(monthly_analyst_completed, use_container_width=True)
+    generate_download_link(monthly_analyst_completed, "monthly_analyst_completed_count.csv")
+
+ 
+
 
 #Delay days and TAT
 with tabs[3]:
@@ -844,10 +939,7 @@ with tabs[3]:
     st.markdown("#### Download Raw Delay Data")
     generate_download_link(df_delay, "full_delay_data.csv")
 
-
-
-
-#Forecasting
+#Forecast
 
 with tabs[4]:
     st.header("Forecasting with Prophet (Selected Tests Only)")
@@ -862,13 +954,18 @@ with tabs[4]:
         st.info("Please select one or more tests from the sidebar to view forecast.")
         st.stop()
 
-    # Use only completed tests and their actual completion dates for actuals
-    base = df[(df["Status"] == "Completed") & df["Completion_Date"].notna()].copy()
-    base["ds"] = pd.to_datetime(base["Completion_Date"], errors="coerce")
+    # --- Filter completed tests by COMPLETION DATE in selected range ---
+    completed_df = df_raw[
+        (df_raw["Status"] == "Completed") &
+        (df_raw["Completion_Date"].notna()) &
+        (df_raw["Completion_Date"] >= pd.to_datetime(start_date)) &
+        (df_raw["Completion_Date"] <= pd.to_datetime(end_date))
+    ].copy()
+    completed_df["ds"] = pd.to_datetime(completed_df["Completion_Date"], errors="coerce")
 
     for test in test_filter:
         st.subheader(f"Forecast for: {test}")
-        test_df = base[base["Test_Name"] == test].copy().dropna(subset=["ds", "Price"])
+        test_df = completed_df[completed_df["Test_Name"] == test].copy().dropna(subset=["ds", "Price"])
 
         if test_df.empty or test_df["ds"].nunique() < 4:
             st.warning(f"Not enough valid data to forecast '{test}'")
